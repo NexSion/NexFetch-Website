@@ -1,98 +1,93 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import GlassCard from "@/components/GlassCard";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 export default function LoginPage() {
-  const router = useRouter();
   const search = useSearchParams();
   const dkey = search.get("dkey");
   const supabase = createSupabaseBrowserClient();
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  async function handleGoogleLogin() {
     setLoading(true);
     setError(null);
 
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    // Carry the pending device_key through so /auth/callback can claim
+    // it the moment the OAuth session exists — same mechanism the
+    // email-confirmation flow on /register uses.
+    const redirect = new URL(`${window.location.origin}/auth/callback`);
+    if (dkey) redirect.searchParams.set("dkey", dkey);
+
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: { redirectTo: redirect.toString() }
+    });
 
     if (error) {
       setLoading(false);
       setError(error.message);
-      return;
     }
-
-    // If we arrived here from the extension's /installed page with a
-    // pending device_key, claim it now that there's a session cookie.
-    if (dkey) {
-      await fetch("/api/device/claim", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_key: dkey })
-      }).catch(() => {});
-    }
-
-    setLoading(false);
-    router.push("/dashboard");
-    router.refresh();
+    // On success Supabase redirects to Google, so no further action here.
   }
 
   return (
     <div className="mx-auto flex min-h-[70vh] max-w-md items-center px-6">
-      <GlassCard className="w-full glow-border">
-        <h1 className="font-display text-2xl text-white">Log in to NexFetch</h1>
-        <p className="mt-2 text-sm text-white/50">
+      <GlassCard className="w-full glow-border text-center">
+        <h1 className="font-display text-2xl text-foreground">Log in to NexFetch</h1>
+        <p className="mt-2 text-sm text-muted-foreground">
           The extension uses this same session — log in here once and it stays linked.
         </p>
 
-        <form onSubmit={handleSubmit} className="mt-6 flex flex-col gap-4">
-          <div>
-            <label className="text-sm text-white/70">Email</label>
-            <input
-              type="email"
-              required
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-blue-glow"
-            />
-          </div>
-          <div>
-            <label className="text-sm text-white/70">Password</label>
-            <input
-              type="password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="mt-1 w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-white outline-none focus:border-blue-glow"
-            />
-          </div>
+        <button
+          type="button"
+          onClick={handleGoogleLogin}
+          disabled={loading}
+          className="mt-6 flex w-full items-center justify-center gap-3 rounded-lg border border-border bg-secondary px-5 py-2.5 font-medium text-foreground transition-colors hover:bg-accent disabled:opacity-50"
+        >
+          <GoogleIcon />
+          {loading ? "Redirecting..." : "Continue with Google"}
+        </button>
 
-          {error && <p className="text-sm text-red-400">{error}</p>}
+        {error && <p className="mt-4 text-sm text-destructive">{error}</p>}
 
-          <button
-            type="submit"
-            disabled={loading}
-            className="mt-2 rounded-full bg-nex-gradient px-5 py-2.5 font-medium text-white shadow-lg shadow-violet-deep/30 disabled:opacity-50"
-          >
-            {loading ? "Logging in…" : "Log in"}
-          </button>
-        </form>
-
-        <p className="mt-6 text-center text-sm text-white/50">
+        <p className="mt-6 text-center text-sm text-muted-foreground">
           No account yet?{" "}
-          <Link href={dkey ? `/register?dkey=${encodeURIComponent(dkey)}` : "/register"} className="text-blue-glow hover:underline">
+          <Link
+            href={dkey ? `/register?dkey=${encodeURIComponent(dkey)}` : "/register"}
+            className="text-primary hover:underline"
+          >
             Sign up
           </Link>
         </p>
       </GlassCard>
     </div>
+  );
+}
+
+function GoogleIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+      <path
+        fill="#4285F4"
+        d="M17.64 9.2c0-.64-.06-1.25-.16-1.84H9v3.48h4.84a4.14 4.14 0 0 1-1.8 2.72v2.26h2.9c1.7-1.57 2.7-3.88 2.7-6.62z"
+      />
+      <path
+        fill="#34A853"
+        d="M9 18c2.43 0 4.47-.8 5.96-2.18l-2.9-2.26c-.8.54-1.84.86-3.06.86-2.35 0-4.34-1.59-5.05-3.72H.95v2.33A9 9 0 0 0 9 18z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M3.95 10.7A5.4 5.4 0 0 1 3.67 9c0-.59.1-1.16.28-1.7V4.97H.95A9 9 0 0 0 0 9c0 1.45.35 2.83.95 4.03l3-2.33z"
+      />
+      <path
+        fill="#EA4335"
+        d="M9 3.58c1.32 0 2.51.46 3.44 1.35l2.58-2.58C13.46.89 11.43 0 9 0A9 9 0 0 0 .95 4.97l3 2.33C4.66 5.17 6.65 3.58 9 3.58z"
+      />
+    </svg>
   );
 }
