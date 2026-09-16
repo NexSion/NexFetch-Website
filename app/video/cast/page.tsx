@@ -1,23 +1,40 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useParams, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { ExtensionBridge } from "@/lib/bridge";
 
-// Route matched by manifest.json's content_scripts entry for bridge.js:
-//   *://nexfetch.vercel.app/video/cast/*
-// This page hosts the media source that a Chromecast receiver pulls
-// from — the cast session itself is initiated from the extension
-// popup using the Cast SDK; this page's job is (a) enforce the daily
-// cast quota and (b) resolve+serve the underlying media URL.
+type CastData = {
+  url?: string;
+  source_url?: string;
+  title?: string;
+  thumb?: string | null;
+  quality?: string | null;
+  domain?: string | null;
+  audio_url?: string | null;
+  stream_type?: "dash";
+};
+
+function decodeData(raw: string | null): CastData | null {
+  if (!raw) return null;
+  try {
+    const binary = atob(raw);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
 export default function CastPage() {
-  const params = useParams<{ id: string }>();
   const search = useSearchParams();
   const tabId = search.get("tid");
-  const directUrl = search.get("url");
-  const title = search.get("title") ?? "NexFetch cast";
+  const videoId = search.get("id");
+  const deviceKey = search.get("dkey");
+  const payload = decodeData(search.get("data"));
+  const title = payload?.title ?? "NexFetch cast";
 
-  const [src, setSrc] = useState<string | null>(directUrl);
+  const [src, setSrc] = useState<string | null>(payload?.url ?? null);
   const [status, setStatus] = useState<"checking" | "blocked" | "ready" | "error">("checking");
   const [message, setMessage] = useState("Checking your daily cast limit…");
 
@@ -30,22 +47,22 @@ export default function CastPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({})
+          body: JSON.stringify(deviceKey ? { device_key: deviceKey } : {})
         });
         const json = await res.json();
-        if (json.success && json.allowed === false) {
+        if (json.success && json.data?.allowed === false) {
           setStatus("blocked");
-          setMessage(`Daily cast limit reached (${json.limit}/day on the free plan). Upgrade for unlimited casting.`);
+          setMessage(`Daily cast limit reached (${json.data.limit}/day on the free plan). Upgrade for unlimited casting.`);
           return;
         }
       } catch {
         // fail open, same reasoning as the stream page
       }
 
-      if (!directUrl && tabId) {
+      if (!src && videoId && tabId) {
         bridge = new ExtensionBridge(tabId);
         try {
-          const data = (await bridge.getHlsVideoData(params.id)) as { url?: string } | null;
+          const data = (await bridge.getHlsVideoData(videoId)) as { url?: string } | null;
           if (data?.url) {
             setSrc(data.url);
           } else {
@@ -58,6 +75,10 @@ export default function CastPage() {
           setMessage("NexFetch extension not detected on this tab.");
           return;
         }
+      } else if (!src) {
+        setStatus("error");
+        setMessage("No video data found in this link.");
+        return;
       }
 
       setStatus("ready");
@@ -65,7 +86,7 @@ export default function CastPage() {
 
     run();
     return () => bridge?.close();
-  }, [directUrl, params.id, tabId]);
+  }, [src, videoId, tabId, deviceKey]);
 
   return (
     <div className="mx-auto max-w-2xl px-6 py-16 text-center">
@@ -83,7 +104,7 @@ export default function CastPage() {
       </div>
 
       {status === "blocked" && (
-        <a
+        
           href="/account"
           className="mt-6 inline-block rounded-full bg-nex-gradient px-5 py-2.5 text-sm font-medium text-white"
         >

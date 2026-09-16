@@ -1,24 +1,47 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { useParams, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { ExtensionBridge } from "@/lib/bridge";
 
-// Route matched by manifest.json's content_scripts entry for bridge.js:
-//   *://nexfetch.vercel.app/video/stream/*
-// [id] is the video's uuid (crypto.randomUUID(), assigned by the
-// extension when it first detected the stream). `tid` in the query
-// string is the originating tab id, used to open the matching
-// BroadcastChannel the injected bridge.js is listening on.
+type StreamData = {
+  url?: string;
+  source_url?: string;
+  title?: string;
+  thumbnail?: string | null;
+  duration?: string;
+  quality?: string;
+  size?: string;
+  audio_url?: string | null;
+  stream_type?: "dash";
+};
+
+// Route hit by the extension as:
+//   /video/stream?data=<base64 JSON>&tid=<tabId>&id=<uuid>&dkey=<deviceKey>
+// `data` carries the resolved video info as base64-encoded JSON (see the
+// extension's `ue()`/`mn()` helpers). `id` is the video's uuid, used only
+// as a fallback lookup key if the bridge needs to re-ask the extension.
+function decodeData(raw: string | null): StreamData | null {
+  if (!raw) return null;
+  try {
+    const binary = atob(raw);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+
 export default function StreamPage() {
-  const params = useParams<{ id: string }>();
   const search = useSearchParams();
   const tabId = search.get("tid");
-  const directUrl = search.get("url");
-  const title = search.get("title") ?? "NexFetch stream";
+  const videoId = search.get("id");
+  const deviceKey = search.get("dkey");
+  const payload = decodeData(search.get("data"));
+  const title = payload?.title ?? "NexFetch stream";
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [src, setSrc] = useState<string | null>(directUrl);
+  const [src, setSrc] = useState<string | null>(payload?.url ?? null);
   const [status, setStatus] = useState<"checking" | "blocked" | "ready" | "error">("checking");
   const [message, setMessage] = useState<string>("Checking your daily stream limit…");
 
@@ -32,12 +55,12 @@ export default function StreamPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
-          body: JSON.stringify({})
+          body: JSON.stringify(deviceKey ? { device_key: deviceKey } : {})
         });
         const json = await res.json();
-        if (json.success && json.allowed === false) {
+        if (json.success && json.data?.allowed === false) {
           setStatus("blocked");
-          setMessage(`Daily stream limit reached (${json.limit}/day on the free plan). Upgrade for unlimited streaming.`);
+          setMessage(`Daily stream limit reached (${json.data.limit}/day on the free plan). Upgrade for unlimited streaming.`);
           return;
         }
       } catch {
@@ -45,13 +68,12 @@ export default function StreamPage() {
         // fail open rather than breaking the feature for everyone.
       }
 
-      // 2. If we don't already have a direct URL, ask the extension
-      //    (via the bridge it injected on this page) for the resolved
-      //    HLS/DASH data behind this uuid.
-      if (!directUrl && tabId) {
+      // 2. If we don't already have a direct URL (data param missing/broken),
+      //    ask the extension via the bridge for the resolved HLS/DASH data.
+      if (!src && videoId && tabId) {
         bridge = new ExtensionBridge(tabId);
         try {
-          const data = (await bridge.getHlsVideoData(params.id)) as { url?: string } | null;
+          const data = (await bridge.getHlsVideoData(videoId)) as { url?: string } | null;
           if (data?.url) {
             setSrc(data.url);
           } else {
@@ -64,6 +86,10 @@ export default function StreamPage() {
           setMessage("NexFetch extension not detected on this tab. Install or enable it to stream this video.");
           return;
         }
+      } else if (!src) {
+        setStatus("error");
+        setMessage("No video data found in this link.");
+        return;
       }
 
       setStatus("ready");
@@ -71,7 +97,7 @@ export default function StreamPage() {
 
     run();
     return () => bridge?.close();
-  }, [directUrl, params.id, tabId]);
+  }, [src, videoId, tabId, deviceKey]);
 
   return (
     <div className="mx-auto max-w-4xl px-6 py-16">
@@ -88,7 +114,7 @@ export default function StreamPage() {
       </div>
 
       {status === "blocked" && (
-        <a
+        
           href="/account"
           className="mt-6 inline-block rounded-full bg-nex-gradient px-5 py-2.5 text-sm font-medium text-white"
         >
