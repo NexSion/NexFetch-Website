@@ -56,7 +56,7 @@ export default async function DashboardPage() {
         <GlassCard>
           <div className="flex items-center justify-between">
             <h2 className="font-display text-lg text-white">Saved videos</h2>
-            <Link href="/saved" className="text-sm text-blue-glow hover:underline">
+            <Link href="/videos" className="text-sm text-blue-glow hover:underline">
               View all →
             </Link>
           </div>

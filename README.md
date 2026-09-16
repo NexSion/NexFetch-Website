@@ -22,11 +22,23 @@ redesign of it.
   **`POST /api/streaming/check-cast-limit`** — quota enforcement backed
   by a `streaming_usage` table, free/premium numbers in `lib/limits.ts`
   are placeholders — set them to NexFetch's real numbers.
-- **Pages**: landing, login/signup, dashboard (plan + today's usage +
-  counts), account, linked devices (with unlink), saved videos (with
-  remove), `/video/stream/[id]` and `/video/cast/[id]` — these actually
-  speak the `BroadcastChannel` bridge protocol from `bridge.js`
-  (`lib/bridge.ts`), not just a static `<video>` tag.
+- **Pages**: landing, `/login`, `/register`, dashboard (plan + today's
+  usage + counts), account, linked devices (with unlink), `/videos`
+  (saved list, with remove), `/video/stream/[id]` and
+  `/video/cast/[id]` — these actually speak the `BroadcastChannel`
+  bridge protocol from `bridge.js` (`lib/bridge.ts`), not just a
+  static `<video>` tag.
+- **`/installed`, `/uninstalled`, `/disabled`, `/contact`, `/help`,
+  `/pricing`, `/review`, `/changelog`** — every route the extension's
+  own `popup.js`/`options.js`/`service_worker.js` actually redirects
+  to (found via `core.js`'s `ss()` URL builder and the `Ot`/`x` route
+  table it uses — route names like `register`, `videos`,
+  `privacy-policy`, `terms-of-service` come directly from there, not
+  guessed). `/installed` reads the `dkey` query param the extension
+  appends on first install and calls `/api/device/claim` immediately
+  if you're already logged in, or hands the key through `/login` →
+  `/register` → the email-confirm link so it still gets claimed the
+  moment your session exists.
 - **Database**: full schema + Row Level Security in `supabase/schema.sql`.
 
 ## What's intentionally NOT done (be honest about this)
@@ -105,14 +117,33 @@ a Cloudflare cache rule at that point, not before.
 ```
 app/
   page.tsx                     landing
-  login/ signup/               auth
-  dashboard/ account/ saved/   authenticated pages
+  login/ register/             auth
+  dashboard/ account/ videos/  authenticated pages
   video/stream/[id]/           stream player (talks to bridge.js)
   video/cast/[id]/             cast source page
+  installed/ uninstalled/      extension-triggered redirect pages
+  disabled/ contact/ help/
+  pricing/ review/ changelog/
+  privacy-policy/              legal pages (path names match core.js's
+  terms-of-service/            route table exactly)
   api/                         the 7 contract endpoints
 lib/
   supabase/                    browser + server (SSR cookie) clients
   bridge.ts                    BroadcastChannel protocol client
   limits.ts                    free/premium quota numbers
 supabase/schema.sql            full DB schema + RLS
+.gitignore                     node_modules/.next/.env* excluded
 ```
+
+## A note on how the routes were chosen
+
+The first pass of this site guessed route names (`/signup`, `/saved`,
+`/privacy`) instead of checking what the extension actually redirects
+to — that caused the `/installed` 404 you hit after reinstalling. Every
+route name above was re-derived from `core.js`'s `ss()` URL-builder and
+the frozen route-name objects (`Ot` in background code, `x`/`E`/`D` in
+popup/options) by grepping the actual calls, not by pattern-matching
+the brief's wording. If NexFetch-Chrome ever adds a new redirect target
+in a future version, grep `assets/js/popup.js` and `options.js` for new
+`A(...)`/`fe(...)` calls against those route-name objects before adding
+a matching page here.

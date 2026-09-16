@@ -51,7 +51,7 @@ export default function HomePage() {
               Add to Chrome — it&apos;s free
             </a>
             <Link
-              href="/signup"
+              href="/register"
               className="rounded-full border border-white/15 px-7 py-3 font-medium text-white/85 hover:border-blue-glow/60 transition-colors"
             >
               Create an account
@@ -81,7 +81,7 @@ export default function HomePage() {
             time from your dashboard once you need more.
           </p>
           <Link
-            href="/signup"
+            href="/register"
             className="mt-8 inline-block rounded-full bg-nex-gradient px-7 py-3 font-medium text-white shadow-xl shadow-violet-deep/30 hover:opacity-90 transition-opacity"
           >
             Get started

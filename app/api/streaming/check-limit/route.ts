@@ -6,7 +6,7 @@ import { limitFor } from "@/lib/limits";
 // POST api/streaming/check-limit  { device_key?: string }
 // Contract: called before the website's /video/stream/[id] page starts
 // playback, to enforce a daily per-account (or per-device, if signed
-// out) stream limit. Response: { success, data: { allowed, remaining, limit } }.
+// out) stream limit. Response: { success, allowed, remaining, limit }.
 const bodySchema = z.object({ device_key: z.string().uuid().optional() });
 
 export async function POST(request: Request) {
@@ -20,7 +20,7 @@ export async function POST(request: Request) {
   const device_key = parsed.success ? parsed.data.device_key : undefined;
 
   if (!user && !device_key) {
-    return NextResponse.json({ success: false, error: { message: "No identity provided" } }, { status: 400 });
+    return NextResponse.json({ success: false, error: "NO_IDENTITY" }, { status: 400 });
   }
 
   const service = createSupabaseServiceClient();
@@ -37,10 +37,7 @@ export async function POST(request: Request) {
 
   const limit = limitFor("stream", isPremium);
   if (limit === -1) {
-    return NextResponse.json({
-      success: true,
-      data: { allowed: true, remaining: -1, limit: -1, reset_at: null, reason: null }
-    });
+    return NextResponse.json({ success: true, allowed: true, remaining: -1, limit: -1 });
   }
 
   const today = new Date().toISOString().slice(0, 10);
@@ -68,17 +65,10 @@ export async function POST(request: Request) {
     }
   }
 
-  const tomorrow = new Date();
-  tomorrow.setUTCHours(24, 0, 0, 0);
-
   return NextResponse.json({
     success: true,
-    data: {
-      allowed,
-      remaining: Math.max(limit - currentCount - (allowed ? 1 : 0), 0),
-      limit,
-      reset_at: tomorrow.toISOString(),
-      reason: allowed ? null : "daily_limit_reached"
-    }
+    allowed,
+    remaining: Math.max(limit - currentCount - (allowed ? 1 : 0), 0),
+    limit
   });
 }

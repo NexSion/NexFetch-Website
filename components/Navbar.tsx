@@ -20,7 +20,7 @@ export default async function Navbar() {
           <Link href="/#features" className="hover:text-white transition-colors">
             Features
           </Link>
-          <Link href="/saved" className="hover:text-white transition-colors">
+          <Link href="/videos" className="hover:text-white transition-colors">
             Saved videos
           </Link>
           <Link href="/dashboard" className="hover:text-white transition-colors">
@@ -42,7 +42,7 @@ export default async function Navbar() {
                 Log in
               </Link>
               <Link
-                href="/signup"
+                href="/register"
                 className="rounded-full bg-nex-gradient px-4 py-1.5 text-sm font-medium text-white shadow-lg shadow-violet-deep/30 hover:opacity-90 transition-opacity"
               >
                 Get NexFetch
