@@ -2,22 +2,30 @@
 
 // Client-side counterpart to NexFetch-Chrome's content_scripts/bridge.js.
 // The extension injects bridge.js only on nexfetch.vercel.app/video/stream/*
-// and /video/cast/* (see manifest.json content_scripts), where it opens a
+// and /video/cast/* (manifest.json content_scripts), where it opens a
 // BroadcastChannel named `channel-${tabId}` and answers a small set of
-// commands. This page-side helper mirrors that protocol so /video/stream
-// and /video/cast can actually talk to the extension instead of just
-// rendering a static player.
-//
-// Allowed commands (see bridge.js's `O` allow-list for EXT_SEND, and its
-// `p` map for direct commands):
-//   GET_TAB_ID
-//   GET_HLS_VIDEO_DATA          { uuid }
-//   EXT_SEND -> downloads:start       { url, fileName, tabId? }
-//   EXT_SEND -> downloads:settings
-//   EXT_SEND -> downloads:hls-blob    { blobUrl, fileName }
-//   EXT_SEND -> savedVideos:get       { hash }
-//   EXT_SEND -> savedVideos:add       { video }
-//   EXT_SEND -> savedVideos:remove    { hash }
+// commands. This mirrors that protocol page-side.
+
+export interface VideoLinkData {
+  url: string;
+  webpage_url?: string;
+  fileName?: string;
+  title?: string;
+  extension?: string; // "mp4" | "m3u8" | "mpd" | "webm" | ...
+  quality?: string; // e.g. "1080p"
+  width?: number;
+  height?: number;
+  isLive?: boolean;
+  headers?: Record<string, string>; // Referer/Origin/etc some sources need
+  uuid?: string;
+  duration?: number; // seconds
+  size?: number; // bytes, when known
+  audioBitrate?: number;
+  associatedAudioUrl?: string; // separate audio track for muxed-apart HLS
+  thumbnail?: string;
+  groupLabel?: string;
+  sizeStatus?: string;
+}
 
 type BridgeReply = { id: number; data: unknown };
 
@@ -39,9 +47,8 @@ export class ExtensionBridge {
         }
       });
     } catch {
-      // BroadcastChannel unsupported or extension not installed —
-      // callers should treat `available` as false and fall back to
-      // direct <video> playback of the raw URL.
+      // BroadcastChannel unsupported, or the extension never injected
+      // bridge.js on this page (not installed / not on nexfetch.vercel.app)
       this.channel = null;
     }
   }
@@ -69,15 +76,33 @@ export class ExtensionBridge {
   }
 
   getTabId() {
-    return this.send("GET_TAB_ID");
+    return this.send("GET_TAB_ID") as Promise<number>;
   }
 
+  // Returns the full videoLink object background/service_worker.js's Oi()
+  // stores for this tab (url, thumbnail, duration, quality, size,
+  // headers, etc.) — see VideoLinkData above — or null if not found.
   getHlsVideoData(uuid: string) {
-    return this.send("GET_HLS_VIDEO_DATA", { uuid });
+    return this.send("GET_HLS_VIDEO_DATA", { uuid }) as Promise<VideoLinkData | null>;
   }
 
+  // Progressive file (mp4/webm/direct URL): the extension's own
+  // chrome.downloads call handles it directly, no conversion needed.
   startDownload(url: string, fileName: string) {
-    return this.send("EXT_SEND", { message: "downloads:start", url, fileName });
+    return this.send("EXT_SEND", { message: "downloads:start", url, fileName }) as Promise<{
+      ok: boolean;
+    }>;
+  }
+
+  // HLS/DASH: chrome.downloads can't turn a .m3u8 playlist into a
+  // playable file on its own, so the PAGE assembles a blob first (see
+  // lib/hlsDownload.ts) and hands that blob's object URL to the
+  // extension, which saves it via chrome.downloads.
+  sendHlsBlob(blobUrl: string, fileName: string) {
+    return this.send("EXT_SEND", { message: "downloads:hls-blob", blobUrl, fileName }) as Promise<{
+      success: boolean;
+      reason?: string;
+    }>;
   }
 
   getDownloadSettings() {

@@ -24,10 +24,21 @@ redesign of it.
   are placeholders — set them to NexFetch's real numbers.
 - **Pages**: landing, `/login`, `/register`, dashboard (plan + today's
   usage + counts), account, linked devices (with unlink), `/videos`
-  (saved list, with remove), `/video/stream/[id]` and
-  `/video/cast/[id]` — these actually speak the `BroadcastChannel`
-  bridge protocol from `bridge.js` (`lib/bridge.ts`), not just a
-  static `<video>` tag.
+  (saved list, with remove).
+- **`/video/stream/[id]`** — the actual vidow.io-style player/download
+  UI, not a bare `<video>` tag: thumbnail + play-button overlay,
+  duration/quality/size/format chips, "Open source" link, speed
+  control (1x/2x/3x), Auto-start and Auto-save toggles (per-viewer,
+  `localStorage`), an editable filename field, a Start Download button
+  with a live progress bar, and real `.m3u8`/`.mpd` playback via
+  `hls.js` — a plain `<video src="…m3u8">` silently fails in Chrome,
+  which is exactly the "Playback failed" you hit before this pass.
+  `/video/cast/[id]` got the same `hls.js` fix, kept lighter since it's
+  just the cast source, not a download UI.
+- **`lib/hlsDownload.ts`** — a from-scratch `.m3u8` parser + segment
+  fetcher/concatenator for the actual "Start Download" button on HLS
+  sources. Read the limitations comment at the top of that file before
+  relying on it — short version below.
 - **`/installed`, `/uninstalled`, `/disabled`, `/contact`, `/help`,
   `/pricing`, `/review`, `/changelog`** — every route the extension's
   own `popup.js`/`options.js`/`service_worker.js` actually redirects
@@ -48,6 +59,20 @@ redesign of it.
   up to Stripe/Lemon Squeezy later.
 - `fetch-video-info` is a basic scraper, not a full extractor for every
   video platform.
+- **HLS downloads are segment-concatenation, not an ffmpeg-grade
+  remux.** For fMP4/CMAF sources (an `EXT-X-MAP` init segment present)
+  the result is a genuinely valid fragmented MP4. For legacy
+  `.ts`-segmented HLS, the result is a valid MPEG-TS file — plays fine
+  in VLC/mpv, isn't repackaged into `.mp4`. AES-128/SAMPLE-AES
+  encrypted streams are detected and rejected outright rather than
+  half-supported.
+- **HLS download requires the source to allow cross-origin fetches
+  from a browser page.** The extension's background script can bypass
+  CORS via its host permissions; this page-side downloader cannot —
+  that's *why* the extension exists for this part of vidow.io's
+  feature set. Expect some sources to fail with a CORS error here even
+  though the extension's own native flow (once you build that path out
+  further) could reach them.
 - No automated tests.
 - Not deployed anywhere yet — see setup steps below.
 
