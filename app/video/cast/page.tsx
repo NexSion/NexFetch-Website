@@ -36,7 +36,7 @@ export default function CastPage() {
 
   const [src, setSrc] = useState<string | null>(payload?.url ?? null);
   const [status, setStatus] = useState<"checking" | "blocked" | "ready" | "error">("checking");
-  const [message, setMessage] = useState("Checking your daily cast limit…");
+  const [message, setMessage] = useState("Checking your daily cast limit...");
 
   useEffect(() => {
     let bridge: ExtensionBridge | null = null;
@@ -52,11 +52,13 @@ export default function CastPage() {
         const json = await res.json();
         if (json.success && json.data?.allowed === false) {
           setStatus("blocked");
-          setMessage(`Daily cast limit reached (${json.data.limit}/day on the free plan). Upgrade for unlimited casting.`);
+          setMessage(
+            "Daily cast limit reached (" + json.data.limit + "/day on the free plan). Upgrade for unlimited casting."
+          );
           return;
         }
       } catch {
-        // fail open, same reasoning as the stream page
+        // fail open
       }
 
       if (!src && videoId && tabId) {
@@ -92,7 +94,7 @@ export default function CastPage() {
     <div className="mx-auto max-w-2xl px-6 py-16 text-center">
       <h1 className="font-display text-2xl text-white">{decodeURIComponent(title)}</h1>
       <p className="mt-2 text-sm text-white/50">
-        This tab is the cast source — start casting from the NexFetch toolbar popup.
+        This tab is the cast source - start casting from the NexFetch toolbar popup.
       </p>
 
       <div className="mt-8 rounded-2xl glow-border bg-black/40 p-10">
@@ -104,7 +106,7 @@ export default function CastPage() {
       </div>
 
       {status === "blocked" && (
-        
+        <a
           href="/account"
           className="mt-6 inline-block rounded-full bg-nex-gradient px-5 py-2.5 text-sm font-medium text-white"
         >

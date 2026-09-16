@@ -114,7 +114,7 @@ export default function StreamPage() {
       </div>
 
       {status === "blocked" && (
-        
+        <a
           href="/account"
           className="mt-6 inline-block rounded-full bg-nex-gradient px-5 py-2.5 text-sm font-medium text-white"
         >
