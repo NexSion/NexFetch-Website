@@ -134,24 +134,43 @@ export default function StreamPage() {
     let cancelled = false;
 
     async function attach() {
-      if (isHls) {
-        if (video.canPlayType("application/vnd.apple.mpegurl")) {
-          // Safari: native HLS support, no library needed.
-          video.src = src as string;
-          return;
-        }
-        const { default: Hls } = await import("hls.js");
-        if (cancelled) return;
-        if (Hls.isSupported()) {
-          hls = new Hls();
-          hls.loadSource(src as string);
-          hls.attachMedia(video);
+      try {
+        if (isHls) {
+          if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            // Safari: native HLS support, no library needed.
+            video.src = src as string;
+            return;
+          }
+          const { default: Hls } = await import("hls.js");
+          if (cancelled) return;
+          if (Hls.isSupported()) {
+            hls = new Hls();
+            hls.on(Hls.Events.ERROR, (_event, data) => {
+              // eslint-disable-next-line no-console
+              console.error("hls.js error", data);
+              if (data.fatal && !cancelled) {
+                setStatus("error");
+                setMessage(
+                  `Couldn't load this stream (${data.details}). The link may have expired — try reopening it from the extension.`
+                );
+              }
+            });
+            hls.loadSource(src as string);
+            hls.attachMedia(video);
+          } else {
+            setStatus("error");
+            setMessage("This browser can't play HLS streams. Try Chrome, Edge, Firefox, or Safari.");
+          }
         } else {
-          setStatus("error");
-          setMessage("This browser can't play HLS streams. Try Chrome, Edge, Firefox, or Safari.");
+          video.src = src as string;
         }
-      } else {
-        video.src = src as string;
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("stream attach failed", err);
+        if (!cancelled) {
+          setStatus("error");
+          setMessage("Couldn't start playback. Please try again.");
+        }
       }
     }
 
@@ -179,8 +198,16 @@ export default function StreamPage() {
               ref={videoRef}
               controls
               autoPlay
+              poster={payload?.thumbnail ?? undefined}
               onPlay={() => setIsPlaying(true)}
               onPause={() => setIsPlaying(false)}
+              onError={() => {
+                const err = videoRef.current?.error;
+                // eslint-disable-next-line no-console
+                console.error("video element error", err);
+                setStatus("error");
+                setMessage("Playback failed. The video link may have expired.");
+              }}
               className="h-full w-full"
             />
           ) : (
