@@ -215,13 +215,29 @@ export default function StreamPage() {
       }
       setDownloadState("done");
     } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("download failed", err);
       setDownloadState("error");
+
+      const msg = err instanceof Error ? err.message : "";
+      const fetchStatus = /^(PLAYLIST_FETCH_FAILED|SEGMENT_FETCH_FAILED)_(\d+)$/.exec(msg);
+
       setDownloadError(
-        err instanceof Error && err.message === "ENCRYPTED_STREAM_UNSUPPORTED"
+        msg === "ENCRYPTED_STREAM_UNSUPPORTED"
           ? "This stream is encrypted (DRM) — NexFetch can't download it."
-          : err instanceof Error && err.message === "DASH_NOT_SUPPORTED"
+          : msg === "DASH_NOT_SUPPORTED"
             ? "DASH downloads aren't implemented yet."
-            : "Download failed — the source may block cross-origin access from this page."
+            : msg === "NO_VARIANTS_FOUND" || msg === "NO_SEGMENTS_FOUND"
+              ? "Couldn't find a downloadable stream in this playlist."
+              : fetchStatus
+                ? `Download failed — the source returned HTTP ${fetchStatus[2]} while fetching ${
+                    fetchStatus[1] === "PLAYLIST_FETCH_FAILED" ? "the playlist" : "a video segment"
+                  }. The link may have expired — try reopening this from the extension.`
+                : msg === "EXTENSION_SAVE_FAILED"
+                  ? "The extension couldn't save the file. Try again or check its permissions."
+                  : `Download failed — the source may block cross-origin access from this page.${
+                      msg ? ` (${msg})` : ""
+                    }`
       );
     }
   }
