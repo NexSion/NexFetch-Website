@@ -5,11 +5,16 @@
 // single Blob the extension can hand to chrome.downloads (via
 // bridge.sendHlsBlob — see downloads:hls-blob in service_worker.js).
 //
+// AES-128 (the standard, non-DRM HLS content-key scheme used by most
+// CDNs, including Bunny Stream) is decrypted client-side via
+// SubtleCrypto — the key is fetched over HTTP and used with AES-CBC,
+// exactly like hls.js does for in-browser playback.
+//
 // Honest limitations, on purpose rather than by accident:
-//  - No AES-128 / SAMPLE-AES decryption. An EXT-X-KEY with METHOD other
-//    than NONE throws ENCRYPTED_STREAM_UNSUPPORTED — decrypting would
-//    need the key delivery + IV handling wired up, which is real scope
-//    beyond what this pass covers.
+//  - SAMPLE-AES / SAMPLE-AES-CTR / SAMPLE-AES-CENC (real DRM schemes —
+//    Widevine, FairPlay, PlayReady) throw ENCRYPTED_STREAM_UNSUPPORTED.
+//    These encrypt individual media samples inside the container and
+//    require a licensed key exchange; there's no client-side bypass.
 //  - This concatenates segments; it does not remux to a strictly
 //    spec-clean container the way ffmpeg would. For fMP4/CMAF HLS
 //    (an EXT-X-MAP init segment present) the result is a genuinely
@@ -35,25 +40,55 @@ function resolveUrl(base: string, ref: string): string {
   }
 }
 
-interface MediaPlaylist {
-  segmentUris: string[];
-  mapUri: string | null;
-  encrypted: boolean;
+interface KeyState {
+  method: string;
+  keyUri: string;
+  ivHex: string | null; // explicit IV attribute, if present (without 0x)
 }
+
+interface ParsedSegment {
+  uri: string;
+  sequence: number;
+  key: KeyState | null;
+}
+
+interface MediaPlaylist {
+  segments: ParsedSegment[];
+  mapUri: string | null;
+}
+
+const SUPPORTED_ENCRYPTED_METHODS = new Set(["AES-128"]);
 
 function parseMediaPlaylist(text: string, baseUrl: string): MediaPlaylist {
   const lines = text.split("\n").map((l) => l.trim());
-  const segmentUris: string[] = [];
+  const segments: ParsedSegment[] = [];
   let mapUri: string | null = null;
-  let encrypted = false;
+  let currentKey: KeyState | null = null;
+  let sequence = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!line) continue;
 
+    if (line.startsWith("#EXT-X-MEDIA-SEQUENCE")) {
+      const n = Number(line.split(":")[1]);
+      if (!Number.isNaN(n)) sequence = n;
+      continue;
+    }
+
     if (line.startsWith("#EXT-X-KEY")) {
-      const method = /METHOD=([^,]+)/.exec(line)?.[1];
-      if (method && method !== "NONE") encrypted = true;
+      const method = /METHOD=([^,]+)/.exec(line)?.[1] ?? "NONE";
+      if (method === "NONE") {
+        currentKey = null;
+      } else {
+        const uri = /URI="([^"]+)"/.exec(line)?.[1];
+        const iv = /IV=0[xX]([0-9a-fA-F]+)/.exec(line)?.[1] ?? null;
+        currentKey = {
+          method,
+          keyUri: uri ? resolveUrl(baseUrl, uri) : "",
+          ivHex: iv
+        };
+      }
       continue;
     }
 
@@ -66,14 +101,15 @@ function parseMediaPlaylist(text: string, baseUrl: string): MediaPlaylist {
     if (line.startsWith("#EXTINF")) {
       const next = lines[i + 1];
       if (next && !next.startsWith("#")) {
-        segmentUris.push(resolveUrl(baseUrl, next));
+        segments.push({ uri: resolveUrl(baseUrl, next), sequence, key: currentKey });
+        sequence++;
         i++;
       }
       continue;
     }
   }
 
-  return { segmentUris, mapUri, encrypted };
+  return { segments, mapUri };
 }
 
 interface MasterVariant {
@@ -120,27 +156,78 @@ async function fetchBuffer(url: string, headers?: Record<string, string>): Promi
   return res.arrayBuffer();
 }
 
+// Per HLS spec (RFC 8216 §5.2): if EXT-X-KEY has no IV attribute, the
+// segment's media-sequence number is used as the IV — a 128-bit
+// big-endian integer.
+function sequenceToIv(sequence: number): Uint8Array {
+  const iv = new Uint8Array(16);
+  let n = sequence;
+  for (let i = 15; i >= 0 && n > 0; i--) {
+    iv[i] = n & 0xff;
+    n = Math.floor(n / 256);
+  }
+  return iv;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const clean = hex.length % 2 ? "0" + hex : hex;
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+const keyCache = new Map<string, Promise<CryptoKey>>();
+
+async function getAesKey(keyUri: string, headers?: Record<string, string>): Promise<CryptoKey> {
+  let cached = keyCache.get(keyUri);
+  if (!cached) {
+    cached = fetchBuffer(keyUri, headers).then((buf) =>
+      crypto.subtle.importKey("raw", buf, { name: "AES-CBC" }, false, ["decrypt"])
+    );
+    keyCache.set(keyUri, cached);
+  }
+  return cached;
+}
+
+async function fetchAndDecryptSegment(
+  segment: ParsedSegment,
+  headers: Record<string, string> | undefined
+): Promise<ArrayBuffer> {
+  const buffer = await fetchBuffer(segment.uri, headers);
+  if (!segment.key) return buffer;
+
+  if (!SUPPORTED_ENCRYPTED_METHODS.has(segment.key.method) || !segment.key.keyUri) {
+    throw new Error("ENCRYPTED_STREAM_UNSUPPORTED");
+  }
+
+  const aesKey = await getAesKey(segment.key.keyUri, headers);
+  const iv = segment.key.ivHex ? hexToBytes(segment.key.ivHex) : sequenceToIv(segment.sequence);
+  return crypto.subtle.decrypt({ name: "AES-CBC", iv: iv as BufferSource }, aesKey, buffer);
+}
+
 const CONCURRENCY = 4;
 
 async function fetchAllSegments(
-  urls: string[],
+  segments: ParsedSegment[],
   headers: Record<string, string> | undefined,
   onProgress?: ProgressCallback
 ): Promise<ArrayBuffer[]> {
-  const results = new Array<ArrayBuffer>(urls.length);
+  const results = new Array<ArrayBuffer>(segments.length);
   let completed = 0;
   let cursor = 0;
 
   async function worker() {
-    while (cursor < urls.length) {
+    while (cursor < segments.length) {
       const index = cursor++;
-      results[index] = await fetchBuffer(urls[index], headers);
+      results[index] = await fetchAndDecryptSegment(segments[index], headers);
       completed++;
-      onProgress?.(completed / urls.length);
+      onProgress?.(completed / segments.length);
     }
   }
 
-  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, urls.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, segments.length) }, worker));
   return results;
 }
 
@@ -165,16 +252,24 @@ export async function downloadHls(
   }
 
   const mediaText = await fetchText(mediaPlaylistUrl, headers);
-  const { segmentUris, mapUri, encrypted } = parseMediaPlaylist(mediaText, mediaPlaylistUrl);
+  const { segments, mapUri } = parseMediaPlaylist(mediaText, mediaPlaylistUrl);
 
-  if (encrypted) throw new Error("ENCRYPTED_STREAM_UNSUPPORTED");
-  if (!segmentUris.length) throw new Error("NO_SEGMENTS_FOUND");
+  if (!segments.length) throw new Error("NO_SEGMENTS_FOUND");
 
-  const allUris = mapUri ? [mapUri, ...segmentUris] : segmentUris;
-  const buffers = await fetchAllSegments(allUris, headers, onProgress);
+  // Fail fast (before spending time on segment fetches) if any segment
+  // uses a scheme we genuinely can't decrypt.
+  for (const seg of segments) {
+    if (seg.key && !SUPPORTED_ENCRYPTED_METHODS.has(seg.key.method)) {
+      throw new Error("ENCRYPTED_STREAM_UNSUPPORTED");
+    }
+  }
+
+  const mapBuffer = mapUri ? await fetchBuffer(mapUri, headers) : null;
+  const segmentBuffers = await fetchAllSegments(segments, headers, onProgress);
+  const buffers = mapBuffer ? [mapBuffer, ...segmentBuffers] : segmentBuffers;
 
   const container = mapUri ? "mp4" : "ts";
   const blob = new Blob(buffers, { type: container === "mp4" ? "video/mp4" : "video/mp2t" });
 
-  return { blob, container, segmentCount: segmentUris.length };
+  return { blob, container, segmentCount: segments.length };
 }

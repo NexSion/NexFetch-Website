@@ -1,9 +1,9 @@
 // Central place for the daily quotas the extension's popup checks
 // before starting an HD/HLS download ($e() in popup.js →
 // api/streaming/check-limit) or a cast (Mo() → check-cast-limit).
-// Free-tier numbers are placeholders — tune to NexFetch's real plan.
+// Both tiers are unlimited — the daily-limit feature is disabled.
 export const LIMITS = {
-  free: { stream: 10, cast: 5 },
+  free: { stream: -1, cast: -1 },
   premium: { stream: -1, cast: -1 }
 } as const;
 
