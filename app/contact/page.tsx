@@ -15,7 +15,7 @@ export default function ContactPage() {
     await fetch("/api/reports", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason: "contact_form", details: `${email}: ${message}` })
+      body: JSON.stringify({ type: "contact_form", details: `${email}: ${message}` })
     }).catch(() => {});
     setLoading(false);
     setSent(true);

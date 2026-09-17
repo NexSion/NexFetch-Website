@@ -113,9 +113,13 @@ create policy "saved_videos: delete own" on public.saved_videos
 create table if not exists public.reports (
   id uuid primary key default gen_random_uuid(),
   user_id uuid references auth.users(id) on delete set null,
-  device_key uuid references public.devices(device_key) on delete set null,
+  -- Not a foreign key on purpose: popup.js's "no video found" report
+  -- fires from any device, including ones that were never claimed to
+  -- an account (never inserted into public.devices at all).
+  device_key uuid,
   url text,
-  reason text not null,
+  type text not null,
+  metadata jsonb not null default '{}'::jsonb,
   details text,
   created_at timestamptz not null default now()
 );
@@ -134,12 +138,27 @@ create policy "reports: read own" on public.reports
 create table if not exists public.streaming_usage (
   id uuid primary key default gen_random_uuid(),
   user_id uuid references auth.users(id) on delete cascade,
-  device_key uuid references public.devices(device_key) on delete cascade,
+  -- Not a foreign key on purpose, same reasoning as reports.device_key:
+  -- check-limit/check-cast-limit track usage for devices that were
+  -- never claimed to an account (never inserted into public.devices).
+  device_key uuid,
   kind text not null check (kind in ('stream', 'cast')),
   usage_date date not null default current_date,
-  count integer not null default 0,
-  unique (coalesce(user_id, '00000000-0000-0000-0000-000000000000'::uuid), device_key, kind, usage_date)
+  count integer not null default 0
 );
+
+-- A table-level UNIQUE(...) constraint can't call a function like
+-- coalesce() on its columns — only a unique INDEX can, since indexes
+-- support expressions. This is what actually enforces "one row per
+-- identity+kind+day", covering both the user_id path and the
+-- device_key-only (anonymous) path with a single index.
+create unique index if not exists streaming_usage_identity_kind_date
+  on public.streaming_usage (
+    coalesce(user_id, '00000000-0000-0000-0000-000000000000'::uuid),
+    coalesce(device_key, '00000000-0000-0000-0000-000000000000'::uuid),
+    kind,
+    usage_date
+  );
 
 alter table public.streaming_usage enable row level security;
 

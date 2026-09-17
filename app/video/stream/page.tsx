@@ -1,267 +1,374 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
+import { decodeDataParam } from "@/lib/dataParam";
 import { ExtensionBridge } from "@/lib/bridge";
+import { downloadHls } from "@/lib/hlsDownload";
+import { formatBytes, formatDuration } from "@/lib/format";
+import GlassCard from "@/components/GlassCard";
 
-type StreamData = {
-  url?: string;
-  source_url?: string;
-  title?: string;
+// Route: /video/stream?data=<base64>&tid=<tabId>&id=<uuid>&dkey=<deviceKey>
+//
+// Confirmed directly from popup.js's hn()/mn()/ue(): the extension
+// does NOT ask this page to look a video up by id — it base64-encodes
+// the whole payload into `data` up front. `id` and `dkey` ride along
+// only so this page can talk back to the extension (via the
+// BroadcastChannel bridge) for the actual download/blob-save step.
+interface StreamPayload {
+  url: string;
+  source_url?: string | null;
+  title?: string | null;
   thumbnail?: string | null;
-  duration?: string;
-  quality?: string;
-  size?: string;
+  duration?: string | null; // seconds, as a string
+  quality?: string | null;
+  size?: string | null; // bytes, as a string
   audio_url?: string | null;
   stream_type?: "dash";
-};
-
-function decodeData(raw: string | null): StreamData | null {
-  if (!raw) return null;
-  try {
-    const binary = atob(raw);
-    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-    return JSON.parse(new TextDecoder().decode(bytes));
-  } catch {
-    return null;
-  }
 }
 
-function formatDuration(seconds?: string) {
-  const s = Number(seconds);
-  if (!s || Number.isNaN(s)) return null;
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = Math.floor(s % 60);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return h > 0 ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
-}
+type DownloadState = "idle" | "downloading" | "done" | "error";
 
-function formatSize(bytes?: string) {
-  const b = Number(bytes);
-  if (!b || Number.isNaN(b)) return null;
-  const gb = b / 1024 ** 3;
-  if (gb >= 1) return `${gb.toFixed(2)} GB`;
-  const mb = b / 1024 ** 2;
-  return `${mb.toFixed(0)} MB`;
-}
+const AUTOSTART_KEY = "nexfetch:autostart";
+const AUTOSAVE_KEY = "nexfetch:autosave";
 
-function sourceDomain(url?: string) {
-  if (!url) return null;
-  try {
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch {
-    return null;
-  }
+function isM3u8(url: string) {
+  return url.includes(".m3u8");
 }
 
 export default function StreamPage() {
   const search = useSearchParams();
+  const payload = useMemo(() => decodeDataParam<StreamPayload>(search.get("data")), [search]);
   const tabId = search.get("tid");
-  const videoId = search.get("id");
-  const deviceKey = search.get("dkey");
-  const payload = decodeData(search.get("data"));
-  const title = payload?.title ? decodeURIComponent(payload.title) : "NexFetch stream";
+  const uuid = search.get("id");
+  const dkey = search.get("dkey");
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [src, setSrc] = useState<string | null>(payload?.url ?? null);
-  const [status, setStatus] = useState<"checking" | "blocked" | "ready" | "error">("checking");
-  const [message, setMessage] = useState<string>("Checking your daily stream limit...");
+  const hlsRef = useRef<import("hls.js").default | null>(null);
+
+  const [limitState, setLimitState] = useState<"checking" | "allowed" | "blocked">("checking");
+  const [limitMessage, setLimitMessage] = useState("");
+  const [playerError, setPlayerError] = useState("");
   const [isPlaying, setIsPlaying] = useState(false);
+  const [speed, setSpeed] = useState<1 | 2 | 3>(1);
+  const [autoStart, setAutoStart] = useState(false);
+  const [autoSave, setAutoSave] = useState(false);
+  const [autoSaved, setAutoSaved] = useState(false);
+  const [filename, setFilename] = useState(payload?.title ?? "");
+  const [downloadState, setDownloadState] = useState<DownloadState>("idle");
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadError, setDownloadError] = useState("");
 
-  // 1. Enforce the daily stream quota, then resolve a playable src.
   useEffect(() => {
-    let bridge: ExtensionBridge | null = null;
+    setAutoStart(localStorage.getItem(AUTOSTART_KEY) === "1");
+    setAutoSave(localStorage.getItem(AUTOSAVE_KEY) === "1");
+  }, []);
 
-    async function run() {
-      try {
-        const res = await fetch("/api/streaming/check-limit", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify(deviceKey ? { device_key: deviceKey } : {})
-        });
-        const json = await res.json();
+  function toggleAutoStart() {
+    setAutoStart((v) => {
+      localStorage.setItem(AUTOSTART_KEY, v ? "0" : "1");
+      return !v;
+    });
+  }
+  function toggleAutoSave() {
+    setAutoSave((v) => {
+      localStorage.setItem(AUTOSAVE_KEY, v ? "0" : "1");
+      return !v;
+    });
+  }
+
+  // Daily stream limit — dkey may be absent (e.g. a plain shared link);
+  // the route treats a missing device_key as an anonymous/free check.
+  useEffect(() => {
+    fetch("/api/streaming/check-limit", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_key: dkey ?? crypto.randomUUID() })
+    })
+      .then((r) => r.json())
+      .then((json) => {
         if (json.success && json.data?.allowed === false) {
-          setStatus("blocked");
-          setMessage(
-            `Daily stream limit reached (${json.data.limit}/day on the free plan). Upgrade for unlimited streaming.`
-          );
-          return;
-        }
-      } catch {
-        // fail open — don't let a limit-check hiccup block playback
-      }
-
-      if (!src && videoId && tabId) {
-        bridge = new ExtensionBridge(tabId);
-        try {
-          const data = (await bridge.getHlsVideoData(videoId)) as { url?: string } | null;
-          if (data?.url) {
-            setSrc(data.url);
-          } else {
-            setStatus("error");
-            setMessage("Couldn't retrieve this video from the extension. Try reopening it from the popup.");
-            return;
-          }
-        } catch {
-          setStatus("error");
-          setMessage("NexFetch extension not detected on this tab. Install or enable it to stream this video.");
-          return;
-        }
-      } else if (!src) {
-        setStatus("error");
-        setMessage("No video data found in this link.");
-        return;
-      }
-
-      setStatus("ready");
-    }
-
-    run();
-    return () => bridge?.close();
-  }, [src, videoId, tabId, deviceKey]);
-
-  // 2. Attach the resolved src to the <video> element. Plain HTML5 video
-  // can't play .m3u8 (HLS) natively outside Safari, so for HLS sources we
-  // hand it to hls.js and let that feed the MediaSource buffer instead.
-  useEffect(() => {
-    if (status !== "ready" || !src || !videoRef.current) return;
-    const video = videoRef.current;
-    const isHls = payload?.stream_type !== "dash" && /\.m3u8(\?|$)/i.test(src);
-
-    let hls: import("hls.js").default | null = null;
-    let cancelled = false;
-
-    async function attach() {
-      try {
-        if (isHls) {
-          if (video.canPlayType("application/vnd.apple.mpegurl")) {
-            // Safari: native HLS support, no library needed.
-            video.src = src as string;
-            return;
-          }
-          const { default: Hls } = await import("hls.js");
-          if (cancelled) return;
-          if (Hls.isSupported()) {
-            hls = new Hls();
-            hls.on(Hls.Events.ERROR, (_event, data) => {
-              // eslint-disable-next-line no-console
-              console.error("hls.js error", data);
-              if (data.fatal && !cancelled) {
-                setStatus("error");
-                setMessage(
-                  `Couldn't load this stream (${data.details}). The link may have expired — try reopening it from the extension.`
-                );
-              }
-            });
-            hls.loadSource(src as string);
-            hls.attachMedia(video);
-          } else {
-            setStatus("error");
-            setMessage("This browser can't play HLS streams. Try Chrome, Edge, Firefox, or Safari.");
-          }
+          setLimitState("blocked");
+          setLimitMessage(`Daily stream limit reached (${json.data.limit}/day on the free plan).`);
         } else {
-          video.src = src as string;
+          setLimitState("allowed");
         }
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error("stream attach failed", err);
-        if (!cancelled) {
-          setStatus("error");
-          setMessage("Couldn't start playback. Please try again.");
-        }
-      }
+      })
+      .catch(() => setLimitState("allowed"));
+  }, [dkey]);
+
+  useEffect(() => {
+    if (autoSave || !payload || autoSaved) return;
+    // gated by the checkbox below, this effect just reacts to it
+  }, [autoSave, payload, autoSaved]);
+
+  useEffect(() => {
+    if (!autoSave || autoSaved || !payload) return;
+    fetch("/api/videos", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        hash: uuid ?? payload.url,
+        title: payload.title ?? undefined,
+        link: payload.source_url ?? undefined,
+        thumbnail: payload.thumbnail ?? undefined
+      })
+    })
+      .then(() => setAutoSaved(true))
+      .catch(() => {});
+  }, [autoSave, autoSaved, payload, uuid]);
+
+  async function startPlayback() {
+    if (!payload || !videoRef.current) return;
+    setIsPlaying(true);
+    const video = videoRef.current;
+
+    if (payload.stream_type === "dash") {
+      setPlayerError("DASH (.mpd) playback isn't implemented yet — this needs a DASH player (e.g. dash.js), not hls.js.");
+      return;
     }
 
-    attach();
-    return () => {
-      cancelled = true;
-      hls?.destroy();
-    };
-  }, [status, src, payload?.stream_type]);
+    if (isM3u8(payload.url)) {
+      const { default: Hls } = await import("hls.js");
+      if (Hls.isSupported()) {
+        const hls = new Hls();
+        hlsRef.current = hls;
+        hls.loadSource(payload.url);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+        hls.on(Hls.Events.ERROR, (_evt, data) => {
+          if (data.fatal) setPlayerError("Playback failed — the stream link may have expired.");
+        });
+      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+        video.src = payload.url;
+        video.play().catch(() => {});
+      } else {
+        setPlayerError("This browser can't play HLS streams.");
+      }
+    } else {
+      video.src = payload.url;
+      video.play().catch(() => {});
+    }
+  }
 
-  const meta = [
-    formatDuration(payload?.duration),
-    payload?.quality,
-    formatSize(payload?.size),
-    payload?.stream_type === "dash" ? "DASH" : "HLS",
-    sourceDomain(payload?.source_url)
-  ].filter(Boolean) as string[];
+  useEffect(() => {
+    if (autoStart && limitState === "allowed" && payload && !isPlaying) startPlayback();
+    return () => {
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStart, limitState, payload]);
+
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = speed;
+  }, [speed]);
+
+  async function handleDownload() {
+    if (!payload) return;
+    setDownloadState("downloading");
+    setDownloadProgress(0);
+    setDownloadError("");
+    const finalName = (filename || payload.title || "nexfetch-video").trim();
+
+    try {
+      if (payload.stream_type === "dash") {
+        throw new Error("DASH_NOT_SUPPORTED");
+      }
+
+      if (isM3u8(payload.url)) {
+        // Note: the extension's own URL payload doesn't include custom
+        // request headers (Referer/Origin) for this page — some
+        // sources that require them will fail here with a CORS or 403
+        // error even though the extension's own background-script
+        // download path could reach them.
+        const { blob, container } = await downloadHls(payload.url, { onProgress: setDownloadProgress });
+        const ext = container === "mp4" ? "mp4" : "ts";
+        const blobUrl = URL.createObjectURL(blob);
+        const fullName = `${finalName}.${ext}`;
+
+        const bridge = tabId ? new ExtensionBridge(tabId) : null;
+        if (bridge?.available) {
+          const result = await bridge.sendHlsBlob(blobUrl, fullName);
+          bridge.close();
+          if (!result.success) throw new Error(result.reason ?? "EXTENSION_SAVE_FAILED");
+        } else {
+          const a = document.createElement("a");
+          a.href = blobUrl;
+          a.download = fullName;
+          a.click();
+        }
+      } else {
+        const fullName = `${finalName}.mp4`;
+        const bridge = tabId ? new ExtensionBridge(tabId) : null;
+        if (bridge?.available) {
+          await bridge.startDownload(payload.url, fullName);
+          bridge.close();
+        } else {
+          const a = document.createElement("a");
+          a.href = payload.url;
+          a.download = fullName;
+          a.click();
+        }
+      }
+      setDownloadState("done");
+    } catch (err) {
+      setDownloadState("error");
+      setDownloadError(
+        err instanceof Error && err.message === "ENCRYPTED_STREAM_UNSUPPORTED"
+          ? "This stream is encrypted (DRM) — NexFetch can't download it."
+          : err instanceof Error && err.message === "DASH_NOT_SUPPORTED"
+            ? "DASH downloads aren't implemented yet."
+            : "Download failed — the source may block cross-origin access from this page."
+      );
+    }
+  }
+
+  const chips = useMemo(() => {
+    if (!payload) return [];
+    return [
+      formatDuration(payload.duration ? Number(payload.duration) : undefined),
+      payload.quality,
+      formatBytes(payload.size ? Number(payload.size) : undefined),
+      (payload.stream_type === "dash" ? "DASH" : isM3u8(payload.url) ? "HLS" : null),
+      payload.source_url ? (() => {
+        try {
+          return new URL(payload.source_url!).hostname;
+        } catch {
+          return null;
+        }
+      })() : null
+    ].filter(Boolean) as string[];
+  }, [payload]);
+
+  if (limitState === "checking") {
+    return <div className="mx-auto max-w-4xl px-6 py-16 text-center text-white/60">Checking your daily stream limit…</div>;
+  }
+
+  if (limitState === "blocked") {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-16 text-center">
+        <GlassCard className="glow-border">
+          <p className="text-white">{limitMessage}</p>
+          <a href="/pricing" className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white">
+            View upgrade options
+          </a>
+        </GlassCard>
+      </div>
+    );
+  }
+
+  if (!payload) {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">
+        No video data in the link — open this from the NexFetch popup.
+      </div>
+    );
+  }
 
   return (
-    <div className="mx-auto max-w-4xl px-6 py-16">
-      <div className="overflow-hidden rounded-lg border border-border bg-card glow-border">
-        <div className="relative aspect-video w-full bg-black">
-          {status === "ready" && src ? (
-            <video
-              ref={videoRef}
-              controls
-              autoPlay
-              poster={payload?.thumbnail ?? undefined}
-              onPlay={() => setIsPlaying(true)}
-              onPause={() => setIsPlaying(false)}
-              onError={() => {
-                const err = videoRef.current?.error;
-                // eslint-disable-next-line no-console
-                console.error("video element error", err);
-                setStatus("error");
-                setMessage("Playback failed. The video link may have expired.");
-              }}
-              className="h-full w-full"
-            />
-          ) : (
-            <div className="flex h-full w-full items-center justify-center px-8 text-center text-sm text-muted-foreground">
-              {status === "checking" ? (
-                <span className="flex items-center gap-2">
-                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-muted-foreground/40 border-t-primary" />
-                  {message}
-                </span>
-              ) : (
-                message
-              )}
-            </div>
-          )}
-        </div>
+    <div className="mx-auto max-w-4xl px-6 py-12">
+      <h1 className="font-display text-2xl text-white">{payload.title ?? "NexFetch stream"}</h1>
 
-        <div className="flex flex-wrap items-center justify-between gap-4 border-t border-border p-5">
-          <div>
-            <h1 className="font-display text-lg font-medium text-foreground">{title}</h1>
-            {meta.length > 0 && (
-              <div className="mt-2 flex flex-wrap gap-2">
-                {meta.map((m) => (
-                  <span
-                    key={m}
-                    className="rounded-md border border-border bg-secondary px-2 py-0.5 text-xs text-muted-foreground"
-                  >
-                    {m}
-                  </span>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {payload?.source_url && (
-            <a
-              href={payload.source_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="shrink-0 rounded-md border border-border px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:border-primary/50 hover:text-foreground"
-            >
-              Open source
-            </a>
-          )}
-        </div>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {chips.map((c) => (
+          <span key={c} className="rounded-full border border-white/10 bg-black/30 px-3 py-1 text-xs text-white/60">
+            {c}
+          </span>
+        ))}
       </div>
 
-      {status === "blocked" && (
-        <a
-          href="/account"
-          className="mt-6 inline-block rounded-full bg-nex-gradient px-5 py-2.5 text-sm font-medium text-white"
-        >
-          View upgrade options
+      <div className="relative mt-6 overflow-hidden rounded-2xl glow-border bg-black">
+        {playerError ? (
+          <div className="flex aspect-video w-full items-center justify-center px-8 text-center text-white/60">
+            {playerError}
+          </div>
+        ) : !isPlaying ? (
+          <button onClick={startPlayback} className="group relative flex aspect-video w-full items-center justify-center">
+            {payload.thumbnail ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img src={payload.thumbnail} alt="" className="absolute inset-0 h-full w-full object-cover opacity-70" />
+            ) : null}
+            <span className="relative z-10 flex h-16 w-16 items-center justify-center rounded-full bg-nex-gradient shadow-xl shadow-violet-deep/40 transition-transform group-hover:scale-105">
+              <svg viewBox="0 0 24 24" className="ml-1 h-7 w-7 fill-white">
+                <path d="M8 5v14l11-7z" />
+              </svg>
+            </span>
+          </button>
+        ) : (
+          <video ref={videoRef} controls className="aspect-video w-full" />
+        )}
+      </div>
+
+      {payload.source_url && (
+        <a href={payload.source_url} target="_blank" className="mt-3 inline-block text-sm text-blue-glow hover:underline">
+          Open source →
         </a>
       )}
+
+      <GlassCard className="mt-6">
+        <div className="flex flex-wrap items-center gap-6">
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-white/50">Speed</span>
+            {[1, 2, 3].map((s) => (
+              <button
+                key={s}
+                onClick={() => setSpeed(s as 1 | 2 | 3)}
+                className={`rounded-full px-3 py-1 text-xs font-medium transition-colors ${
+                  speed === s ? "bg-nex-gradient text-white" : "border border-white/10 text-white/60 hover:text-white"
+                }`}
+              >
+                {s}x
+              </button>
+            ))}
+          </div>
+
+          <label className="flex items-center gap-2 text-sm text-white/70">
+            <input type="checkbox" checked={autoStart} onChange={toggleAutoStart} className="accent-violet-glow" />
+            Auto-start
+          </label>
+
+          <label className="flex items-center gap-2 text-sm text-white/70">
+            <input type="checkbox" checked={autoSave} onChange={toggleAutoSave} className="accent-violet-glow" />
+            Auto-save
+            {autoSave && autoSaved && <span className="text-xs text-green-400">saved ✓</span>}
+          </label>
+        </div>
+      </GlassCard>
+
+      <GlassCard className="mt-4">
+        <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/30 px-3 py-2">
+          <input
+            value={filename}
+            onChange={(e) => setFilename(e.target.value)}
+            placeholder="File name"
+            className="flex-1 bg-transparent text-white outline-none"
+          />
+          <span className="text-sm text-white/40">.{isM3u8(payload.url) ? "mp4/ts" : "mp4"}</span>
+        </div>
+
+        <button
+          onClick={handleDownload}
+          disabled={downloadState === "downloading"}
+          className="mt-4 flex w-full items-center justify-center gap-2 rounded-full bg-nex-gradient px-5 py-3 text-sm font-medium text-white shadow-lg shadow-violet-deep/30 disabled:opacity-60"
+        >
+          {downloadState === "downloading"
+            ? `Downloading… ${Math.round(downloadProgress * 100)}%`
+            : downloadState === "done"
+              ? "Downloaded — start again"
+              : "Start Download"}
+        </button>
+
+        {downloadState === "downloading" && (
+          <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+            <div className="h-full bg-nex-gradient transition-all" style={{ width: `${Math.round(downloadProgress * 100)}%` }} />
+          </div>
+        )}
+
+        {downloadState === "error" && <p className="mt-3 text-sm text-red-400">{downloadError}</p>}
+      </GlassCard>
     </div>
   );
 }

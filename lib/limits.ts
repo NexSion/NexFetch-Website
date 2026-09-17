@@ -1,8 +1,7 @@
-// Central place for the two daily quotas the extension checks before
-// starting a stream (/api/streaming/check-limit) or a cast
-// (/api/streaming/check-cast-limit). Free-tier numbers are placeholders —
-// tune them to whatever NexFetch's actual pricing model is; premium is
-// unlimited (-1) per the "upgraded" flag already used by the extension.
+// Central place for the daily quotas the extension's popup checks
+// before starting an HD/HLS download ($e() in popup.js →
+// api/streaming/check-limit) or a cast (Mo() → check-cast-limit).
+// Free-tier numbers are placeholders — tune to NexFetch's real plan.
 export const LIMITS = {
   free: { stream: 10, cast: 5 },
   premium: { stream: -1, cast: -1 }
@@ -10,4 +9,10 @@ export const LIMITS = {
 
 export function limitFor(kind: "stream" | "cast", isPremium: boolean) {
   return isPremium ? LIMITS.premium[kind] : LIMITS.free[kind];
+}
+
+export function nextResetAt(): string {
+  const d = new Date();
+  d.setUTCHours(24, 0, 0, 0); // next UTC midnight
+  return d.toISOString();
 }

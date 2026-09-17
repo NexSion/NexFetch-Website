@@ -1,195 +1,142 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import { ExtensionBridge } from "@/lib/bridge";
+import { decodeDataParam } from "@/lib/dataParam";
+import { formatDuration } from "@/lib/format";
+import GlassCard from "@/components/GlassCard";
 
-type CastData = {
-  url?: string;
-  source_url?: string;
-  title?: string;
+// Route: /video/cast?data=<base64>&tid=<tabId>&dkey=<deviceKey>
+// Confirmed from popup.js's ko(): note the field is `thumb`, not
+// `thumbnail` (different from the /video/stream payload — the
+// extension's own naming is inconsistent between the two, not a typo
+// on this site's part).
+interface CastPayload {
+  url: string;
+  audio_url?: string | null;
+  source_url?: string | null;
+  title?: string | null;
   thumb?: string | null;
   quality?: string | null;
   domain?: string | null;
-  audio_url?: string | null;
   stream_type?: "dash";
-};
+}
 
-function decodeData(raw: string | null): CastData | null {
-  if (!raw) return null;
-  try {
-    const binary = atob(raw);
-    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-    return JSON.parse(new TextDecoder().decode(bytes));
-  } catch {
-    return null;
-  }
+function isM3u8(url: string) {
+  return url.includes(".m3u8");
 }
 
 export default function CastPage() {
   const search = useSearchParams();
-  const tabId = search.get("tid");
-  const videoId = search.get("id");
-  const deviceKey = search.get("dkey");
-  const payload = decodeData(search.get("data"));
-  const title = payload?.title ? decodeURIComponent(payload.title) : "NexFetch cast";
+  const payload = useMemo(() => decodeDataParam<CastPayload>(search.get("data")), [search]);
+  const dkey = search.get("dkey");
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [src, setSrc] = useState<string | null>(payload?.url ?? null);
-  const [status, setStatus] = useState<"checking" | "blocked" | "ready" | "error">("checking");
-  const [message, setMessage] = useState("Checking your daily cast limit...");
+  const hlsRef = useRef<import("hls.js").default | null>(null);
+
+  const [limitState, setLimitState] = useState<"checking" | "allowed" | "blocked">("checking");
+  const [limitMessage, setLimitMessage] = useState("");
+  const [playerError, setPlayerError] = useState("");
 
   useEffect(() => {
-    let bridge: ExtensionBridge | null = null;
-
-    async function run() {
-      try {
-        const res = await fetch("/api/streaming/check-cast-limit", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify(deviceKey ? { device_key: deviceKey } : {})
-        });
-        const json = await res.json();
+    fetch("/api/streaming/check-cast-limit", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_key: dkey ?? crypto.randomUUID() })
+    })
+      .then((r) => r.json())
+      .then((json) => {
         if (json.success && json.data?.allowed === false) {
-          setStatus("blocked");
-          setMessage(
-            `Daily cast limit reached (${json.data.limit}/day on the free plan). Upgrade for unlimited casting.`
-          );
-          return;
+          setLimitState("blocked");
+          setLimitMessage(`Daily cast limit reached (${json.data.limit}/day on the free plan).`);
+        } else {
+          setLimitState("allowed");
         }
-      } catch {
-        // fail open
-      }
-
-      if (!src && videoId && tabId) {
-        bridge = new ExtensionBridge(tabId);
-        try {
-          const data = (await bridge.getHlsVideoData(videoId)) as { url?: string } | null;
-          if (data?.url) {
-            setSrc(data.url);
-          } else {
-            setStatus("error");
-            setMessage("Couldn't retrieve this video from the extension.");
-            return;
-          }
-        } catch {
-          setStatus("error");
-          setMessage("NexFetch extension not detected on this tab.");
-          return;
-        }
-      } else if (!src) {
-        setStatus("error");
-        setMessage("No video data found in this link.");
-        return;
-      }
-
-      setStatus("ready");
-    }
-
-    run();
-    return () => bridge?.close();
-  }, [src, videoId, tabId, deviceKey]);
+      })
+      .catch(() => setLimitState("allowed"));
+  }, [dkey]);
 
   useEffect(() => {
-    if (status !== "ready" || !src || !videoRef.current) return;
+    if (limitState !== "allowed" || !payload || !videoRef.current) return;
     const video = videoRef.current;
-    const isHls = payload?.stream_type !== "dash" && /\.m3u8(\?|$)/i.test(src);
 
-    let hls: import("hls.js").default | null = null;
-    let cancelled = false;
-
-    async function attach() {
-      try {
-        if (isHls) {
-          if (video.canPlayType("application/vnd.apple.mpegurl")) {
-            video.src = src as string;
-            return;
-          }
-          const { default: Hls } = await import("hls.js");
-          if (cancelled) return;
-          if (Hls.isSupported()) {
-            hls = new Hls();
-            hls.on(Hls.Events.ERROR, (_event, data) => {
-              // eslint-disable-next-line no-console
-              console.error("hls.js error", data);
-              if (data.fatal && !cancelled) {
-                setStatus("error");
-                setMessage(
-                  `Couldn't load this stream (${data.details}). The link may have expired — try reopening it from the extension.`
-                );
-              }
-            });
-            hls.loadSource(src as string);
-            hls.attachMedia(video);
-          } else {
-            setStatus("error");
-            setMessage("This browser can't play HLS streams. Try Chrome, Edge, Firefox, or Safari.");
-          }
-        } else {
-          video.src = src as string;
-        }
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error("cast attach failed", err);
-        if (!cancelled) {
-          setStatus("error");
-          setMessage("Couldn't start playback. Please try again.");
-        }
-      }
+    if (payload.stream_type === "dash") {
+      setPlayerError("DASH (.mpd) casting isn't implemented yet.");
+      return;
     }
 
-    attach();
+    (async () => {
+      if (isM3u8(payload.url)) {
+        const { default: Hls } = await import("hls.js");
+        if (Hls.isSupported()) {
+          const hls = new Hls();
+          hlsRef.current = hls;
+          hls.loadSource(payload.url);
+          hls.attachMedia(video);
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          video.src = payload.url;
+        } else {
+          setPlayerError("This browser can't play HLS streams.");
+        }
+      } else {
+        video.src = payload.url;
+      }
+    })();
+
     return () => {
-      cancelled = true;
-      hls?.destroy();
+      hlsRef.current?.destroy();
+      hlsRef.current = null;
     };
-  }, [status, src, payload?.stream_type]);
+  }, [limitState, payload]);
+
+  const chips = useMemo(() => {
+    if (!payload) return [];
+    return [payload.quality, payload.stream_type === "dash" ? "DASH" : isM3u8(payload.url) ? "HLS" : null, payload.domain].filter(
+      Boolean
+    ) as string[];
+  }, [payload]);
+
+  if (limitState === "checking") {
+    return <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">Checking your daily cast limit…</div>;
+  }
+
+  if (limitState === "blocked") {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-16 text-center">
+        <GlassCard className="glow-border">
+          <p className="text-white">{limitMessage}</p>
+          <a href="/pricing" className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white">
+            View upgrade options
+          </a>
+        </GlassCard>
+      </div>
+    );
+  }
+
+  if (!payload) {
+    return <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">No video data in the link.</div>;
+  }
 
   return (
     <div className="mx-auto max-w-2xl px-6 py-16 text-center">
-      <h1 className="font-display text-2xl text-foreground">{title}</h1>
-      <p className="mt-2 text-sm text-muted-foreground">
-        This tab is the cast source — start casting from the NexFetch toolbar popup.
-      </p>
-
-      <div className="mt-8 overflow-hidden rounded-lg border border-border bg-card glow-border">
-        {status === "ready" && src ? (
-          <video
-            ref={videoRef}
-            controls
-            poster={payload?.thumb ?? undefined}
-            onError={() => {
-              const err = videoRef.current?.error;
-              // eslint-disable-next-line no-console
-              console.error("video element error", err);
-              setStatus("error");
-              setMessage("Playback failed. The video link may have expired.");
-            }}
-            className="mx-auto aspect-video w-full"
-          />
-        ) : (
-          <div className="flex aspect-video w-full items-center justify-center px-8 text-center text-sm text-muted-foreground">
-            {status === "checking" ? (
-              <span className="flex items-center gap-2">
-                <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-muted-foreground/40 border-t-primary" />
-                {message}
-              </span>
-            ) : (
-              message
-            )}
-          </div>
-        )}
+      <h1 className="font-display text-2xl text-white">{payload.title ?? "NexFetch cast"}</h1>
+      <p className="mt-2 text-sm text-white/50">This tab is the cast source — start casting from the NexFetch toolbar popup.</p>
+      <div className="mt-2 flex flex-wrap justify-center gap-2">
+        {chips.map((c) => (
+          <span key={c} className="rounded-full border border-white/10 bg-black/30 px-3 py-1 text-xs text-white/60">
+            {c}
+          </span>
+        ))}
       </div>
 
-      {status === "blocked" && (
-        <a
-          href="/account"
-          className="mt-6 inline-block rounded-full bg-nex-gradient px-5 py-2.5 text-sm font-medium text-white"
-        >
-          View upgrade options
-        </a>
-      )}
+      <div className="mt-8 overflow-hidden rounded-2xl glow-border bg-black">
+        {playerError ? (
+          <div className="flex aspect-video w-full items-center justify-center px-8 text-center text-white/60">{playerError}</div>
+        ) : (
+          <video ref={videoRef} controls className="aspect-video w-full" />
+        )}
+      </div>
     </div>
   );
 }
