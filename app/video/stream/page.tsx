@@ -120,45 +120,63 @@ export default function StreamPage() {
       .catch(() => {});
   }, [autoSave, autoSaved, payload, uuid]);
 
-  async function startPlayback() {
-    if (!payload || !videoRef.current) return;
+  function startPlayback() {
+    if (!payload) return;
     setIsPlaying(true);
-    const video = videoRef.current;
+  }
 
-    if (payload.stream_type === "dash") {
+  // Runs once the <video> element actually exists in the DOM (i.e.
+  // after isPlaying flips true and React re-renders) — attaching hls.js
+  // or setting .src before that point silently no-ops against a null ref.
+  useEffect(() => {
+    if (!isPlaying || !payload || !videoRef.current) return;
+    const video = videoRef.current;
+    const current = payload;
+
+    if (current.stream_type === "dash") {
       setPlayerError("DASH (.mpd) playback isn't implemented yet — this needs a DASH player (e.g. dash.js), not hls.js.");
       return;
     }
 
-    if (isM3u8(payload.url)) {
-      const { default: Hls } = await import("hls.js");
-      if (Hls.isSupported()) {
-        const hls = new Hls();
-        hlsRef.current = hls;
-        hls.loadSource(payload.url);
-        hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
-        hls.on(Hls.Events.ERROR, (_evt, data) => {
-          if (data.fatal) setPlayerError("Playback failed — the stream link may have expired.");
-        });
-      } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        video.src = payload.url;
-        video.play().catch(() => {});
-      } else {
-        setPlayerError("This browser can't play HLS streams.");
-      }
-    } else {
-      video.src = payload.url;
-      video.play().catch(() => {});
-    }
-  }
+    let cancelled = false;
 
-  useEffect(() => {
-    if (autoStart && limitState === "allowed" && payload && !isPlaying) startPlayback();
+    async function attach() {
+      if (isM3u8(current.url)) {
+        const { default: Hls } = await import("hls.js");
+        if (cancelled) return;
+        if (Hls.isSupported()) {
+          const hls = new Hls();
+          hlsRef.current = hls;
+          hls.loadSource(current.url);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+          hls.on(Hls.Events.ERROR, (_evt, data) => {
+            // eslint-disable-next-line no-console
+            console.error("hls.js error", data);
+            if (data.fatal) setPlayerError(`Playback failed (${data.details}) — the stream link may have expired.`);
+          });
+        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+          video.src = current.url;
+          video.play().catch(() => {});
+        } else {
+          setPlayerError("This browser can't play HLS streams.");
+        }
+      } else {
+        video.src = current.url;
+        video.play().catch(() => {});
+      }
+    }
+
+    attach();
     return () => {
+      cancelled = true;
       hlsRef.current?.destroy();
       hlsRef.current = null;
     };
+  }, [isPlaying, payload]);
+
+  useEffect(() => {
+    if (autoStart && limitState === "allowed" && payload && !isPlaying) startPlayback();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoStart, limitState, payload]);
 
