@@ -60,31 +60,53 @@ export default function CastPage() {
   useEffect(() => {
     if (limitState !== "allowed" || !payload || !videoRef.current) return;
     const video = videoRef.current;
+    const current = payload;
 
-    if (payload.stream_type === "dash") {
+    if (current.stream_type === "dash") {
       setPlayerError("DASH (.mpd) casting isn't implemented yet.");
       return;
     }
 
-    (async () => {
-      if (isM3u8(payload.url)) {
-        const { default: Hls } = await import("hls.js");
-        if (Hls.isSupported()) {
-          const hls = new Hls();
-          hlsRef.current = hls;
-          hls.loadSource(payload.url);
-          hls.attachMedia(video);
-        } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-          video.src = payload.url;
-        } else {
-          setPlayerError("This browser can't play HLS streams.");
-        }
-      } else {
-        video.src = payload.url;
-      }
-    })();
+    let cancelled = false;
 
+    async function attach() {
+      try {
+        const { resolvePlayableUrl } = await import("@/lib/streamProxy");
+        if (isM3u8(current.url)) {
+          const { default: Hls } = await import("hls.js");
+          if (cancelled) return;
+          const playUrl = await resolvePlayableUrl(current);
+          if (cancelled) return;
+          if (Hls.isSupported()) {
+            const hls = new Hls();
+            hlsRef.current = hls;
+            hls.loadSource(playUrl);
+            hls.attachMedia(video);
+            hls.on(Hls.Events.ERROR, (_evt, data) => {
+              // eslint-disable-next-line no-console
+              console.error("hls.js error", data);
+              if (data.fatal) setPlayerError(`Playback failed (${data.details}) — the stream link may have expired.`);
+            });
+          } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
+            video.src = playUrl;
+          } else {
+            setPlayerError("This browser can't play HLS streams.");
+          }
+        } else {
+          const playUrl = await resolvePlayableUrl(current);
+          if (cancelled) return;
+          video.src = playUrl;
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error("cast attach failed", err);
+        if (!cancelled) setPlayerError("Couldn't start casting. Please try again.");
+      }
+    }
+
+    attach();
     return () => {
+      cancelled = true;
       hlsRef.current?.destroy();
       hlsRef.current = null;
     };

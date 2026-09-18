@@ -142,12 +142,17 @@ export default function StreamPage() {
 
     async function attach() {
       if (isM3u8(current.url)) {
-        const { default: Hls } = await import("hls.js");
+        const [{ default: Hls }, { resolvePlayableUrl }] = await Promise.all([
+          import("hls.js"),
+          import("@/lib/streamProxy")
+        ]);
+        if (cancelled) return;
+        const playUrl = await resolvePlayableUrl(current);
         if (cancelled) return;
         if (Hls.isSupported()) {
           const hls = new Hls();
           hlsRef.current = hls;
-          hls.loadSource(current.url);
+          hls.loadSource(playUrl);
           hls.attachMedia(video);
           hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
           hls.on(Hls.Events.ERROR, (_evt, data) => {
@@ -156,13 +161,16 @@ export default function StreamPage() {
             if (data.fatal) setPlayerError(`Playback failed (${data.details}) — the stream link may have expired.`);
           });
         } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-          video.src = current.url;
+          video.src = playUrl;
           video.play().catch(() => {});
         } else {
           setPlayerError("This browser can't play HLS streams.");
         }
       } else {
-        video.src = current.url;
+        const { resolvePlayableUrl } = await import("@/lib/streamProxy");
+        const playUrl = await resolvePlayableUrl(current);
+        if (cancelled) return;
+        video.src = playUrl;
         video.play().catch(() => {});
       }
     }
@@ -197,12 +205,9 @@ export default function StreamPage() {
       }
 
       if (isM3u8(payload.url)) {
-        // Note: the extension's own URL payload doesn't include custom
-        // request headers (Referer/Origin) for this page — some
-        // sources that require them will fail here with a CORS or 403
-        // error even though the extension's own background-script
-        // download path could reach them.
-        const { blob, container } = await downloadHls(payload.url, { onProgress: setDownloadProgress });
+        const { resolvePlayableUrl } = await import("@/lib/streamProxy");
+        const playlistUrl = await resolvePlayableUrl(payload);
+        const { blob, container } = await downloadHls(playlistUrl, { onProgress: setDownloadProgress });
         const ext = container === "mp4" ? "mp4" : "ts";
         const blobUrl = URL.createObjectURL(blob);
         const fullName = `${finalName}.${ext}`;
@@ -220,13 +225,15 @@ export default function StreamPage() {
         }
       } else {
         const fullName = `${finalName}.mp4`;
+        const { resolvePlayableUrl } = await import("@/lib/streamProxy");
+        const fileUrl = await resolvePlayableUrl(payload);
         const bridge = tabId ? new ExtensionBridge(tabId) : null;
         if (bridge?.available) {
-          await bridge.startDownload(payload.url, fullName);
+          await bridge.startDownload(fileUrl, fullName);
           bridge.close();
         } else {
           const a = document.createElement("a");
-          a.href = payload.url;
+          a.href = fileUrl;
           a.download = fullName;
           a.click();
         }
