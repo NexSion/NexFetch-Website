@@ -1,34 +1,44 @@
-// Cloudflare Worker — stream proxy for NexFetch.
+// Cloudflare Worker — stream proxy + HLS download assembler for NexFetch.
 //
-// Why this lives on Cloudflare and not Vercel: this proxy re-fetches
-// and streams full video segments, which for large HLS downloads adds
-// up to real bandwidth fast. Vercel's free plan bills that as "Fast
-// Origin Transfer" with a small monthly cap; Cloudflare Workers' free
-// tier bandwidth is effectively unmetered for this. The website itself
-// (small HTML/JS/API responses) stays on Vercel; only the heavy
-// video-byte-pushing work happens here.
+// Two jobs, both here because both need the same "fetch upstream with a
+// spoofed Referer" capability that only a server (not a browser) has:
 //
-// What it does: some source CDNs (confirmed via browser console: every
-// segment 403s) enforce Referer-based hotlink protection — they only
-// serve requests whose Referer matches the original embedding site.
-// A browser fetch()/XHR can never spoof Referer (forbidden header), so
-// this can only be fixed with a server-to-server fetch, which has no
-// such restriction.
+// 1. GET /?url=<target>&ref=<referer-origin>
+//    Playback proxy. Used only when a source's Referer-based hotlink
+//    protection blocks direct browser requests (most sources don't need
+//    it — see lib/streamProxy.ts's direct-first probe on the website).
+//    Rewrites m3u8 playlists so every URI inside (segments, variant
+//    playlists, EXT-X-KEY/EXT-X-MAP) routes back through this same
+//    worker; hls.js only ever needs the top-level playlist URL.
 //
-// GET /?url=<target>&ref=<referer-origin>
-// - If the target is (or looks like) an HLS playlist, fetch it, then
-//   rewrite every URI inside (segments, variant playlists, EXT-X-KEY
-//   and EXT-X-MAP URIs) into an absolute URL back through this same
-//   worker — so hls.js or any downloader only ever needs the
-//   top-level playlist URL; every reference downstream follows
-//   automatically.
-// - Otherwise, stream the resource through as-is (segments, keys,
-//   thumbnails), forwarding Range/Content-Range for seeking.
+// 2. GET /download?playlist=<url>&ref=<referer>&name=<filename>&height=<n>
+//    Full-file HLS download. Fetches every segment *from the Worker*
+//    (fast Cloudflare-internal network, not the user's browser),
+//    decrypts AES-128 segments as it goes (SubtleCrypto, same as
+//    playback), and streams the concatenated result back as one
+//    ordinary HTTP download (Content-Disposition: attachment) —
+//    something the browser or the extension's chrome.downloads API
+//    can just save directly. No giant Blob ever sits in the webpage's
+//    memory, and no cross-context messaging is needed, so this also
+//    sidesteps the page-idle "BRIDGE_TIMEOUT" failure the old
+//    client-side blob-then-postMessage approach hit.
 //
-// Deploy: `wrangler deploy` from this folder (see wrangler.toml), or
-// paste this file into a new Worker in the Cloudflare dashboard. Then
-// set NEXT_PUBLIC_STREAM_PROXY_BASE in the website's Vercel env vars
-// to the Worker's URL (e.g. https://nexfetch-proxy.<subdomain>.workers.dev).
+//    Memory stays bounded (a few segments' worth) via a small ordered
+//    fetch pipeline (concurrency N, emitted strictly in sequence) —
+//    important since Workers have limited per-request memory and a
+//    multi-GB video can never be buffered whole.
+//
+// Only AES-128 (the standard, non-DRM HLS content-key scheme) is
+// decrypted. Real DRM (SAMPLE-AES / SAMPLE-AES-CENC — Widevine,
+// FairPlay, PlayReady) is rejected on purpose: there's no client-side
+// or server-side bypass for a licensed key exchange.
+//
+// Deploy: `wrangler deploy` from this folder, or paste into a new
+// Worker in the Cloudflare dashboard. Then set
+// NEXT_PUBLIC_STREAM_PROXY_BASE in the website's Vercel env vars to
+// this Worker's URL.
+
+// ---------- shared m3u8 helpers ----------
 
 function resolveUri(base, ref) {
   try {
@@ -38,14 +48,133 @@ function resolveUri(base, ref) {
   }
 }
 
+function isM3u8Text(text) {
+  return text.trimStart().startsWith("#EXTM3U");
+}
+
+function isMasterPlaylist(text) {
+  return text.includes("#EXT-X-STREAM-INF");
+}
+
+function parseMasterPlaylist(text, baseUrl) {
+  const lines = text.split("\n").map((l) => l.trim());
+  const variants = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.startsWith("#EXT-X-STREAM-INF")) continue;
+    const bandwidth = Number(/BANDWIDTH=(\d+)/.exec(line)?.[1] ?? 0);
+    const resolution = /RESOLUTION=\d+x(\d+)/.exec(line)?.[1];
+    const next = lines[i + 1];
+    if (next && !next.startsWith("#")) {
+      variants.push({
+        uri: resolveUri(baseUrl, next),
+        bandwidth,
+        height: resolution ? Number(resolution) : undefined
+      });
+    }
+  }
+  return variants;
+}
+
+// Full segment-level parse (used by the download assembler): tracks
+// EXT-X-KEY state and media-sequence numbers per segment, needed for
+// AES-128 IV derivation.
+function parseMediaPlaylist(text, baseUrl) {
+  const lines = text.split("\n").map((l) => l.trim());
+  const segments = [];
+  let mapUri = null;
+  let currentKey = null;
+  let sequence = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+
+    if (line.startsWith("#EXT-X-MEDIA-SEQUENCE")) {
+      const n = Number(line.split(":")[1]);
+      if (!Number.isNaN(n)) sequence = n;
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-KEY")) {
+      const method = /METHOD=([^,]+)/.exec(line)?.[1] ?? "NONE";
+      if (method === "NONE") {
+        currentKey = null;
+      } else {
+        const uri = /URI="([^"]+)"/.exec(line)?.[1];
+        const iv = /IV=0[xX]([0-9a-fA-F]+)/.exec(line)?.[1] ?? null;
+        currentKey = { method, keyUri: uri ? resolveUri(baseUrl, uri) : "", ivHex: iv };
+      }
+      continue;
+    }
+
+    if (line.startsWith("#EXT-X-MAP")) {
+      const uri = /URI="([^"]+)"/.exec(line)?.[1];
+      if (uri) mapUri = resolveUri(baseUrl, uri);
+      continue;
+    }
+
+    if (line.startsWith("#EXTINF")) {
+      const next = lines[i + 1];
+      if (next && !next.startsWith("#")) {
+        segments.push({ uri: resolveUri(baseUrl, next), sequence, key: currentKey });
+        sequence++;
+        i++;
+      }
+      continue;
+    }
+  }
+
+  return { segments, mapUri };
+}
+
+function hexToBytes(hex) {
+  const clean = hex.length % 2 ? "0" + hex : hex;
+  const bytes = new Uint8Array(clean.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(clean.substring(i * 2, i * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+// Per HLS spec (RFC 8216 §5.2): if EXT-X-KEY has no IV attribute, the
+// segment's media-sequence number is the IV — a 128-bit big-endian int.
+function sequenceToIv(sequence) {
+  const iv = new Uint8Array(16);
+  let n = sequence;
+  for (let i = 15; i >= 0 && n > 0; i--) {
+    iv[i] = n & 0xff;
+    n = Math.floor(n / 256);
+  }
+  return iv;
+}
+
+function buildUpstreamHeaders(request, ref, range) {
+  const headers = { "User-Agent": request.headers.get("user-agent") || "Mozilla/5.0" };
+  if (ref) {
+    headers["Referer"] = ref;
+    try {
+      headers["Origin"] = new URL(ref).origin;
+    } catch {
+      /* ignore */
+    }
+  }
+  if (range) headers["Range"] = range;
+  return headers;
+}
+
+function json(body, status) {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+}
+
+const CORS_HEADERS = { "Access-Control-Allow-Origin": "*" };
+
+// ---------- mode 1: playback proxy (single resource, playlist-rewriting) ----------
+
 function buildProxiedUrl(workerOrigin, target, ref) {
   const params = new URLSearchParams({ url: target });
   if (ref) params.set("ref", ref);
   return `${workerOrigin}/?${params.toString()}`;
-}
-
-function isM3u8Text(text) {
-  return text.trimStart().startsWith("#EXTM3U");
 }
 
 function rewritePlaylist(text, baseUrl, ref, workerOrigin) {
@@ -54,130 +183,231 @@ function rewritePlaylist(text, baseUrl, ref, workerOrigin) {
     .map((raw) => {
       const line = raw.trim();
       if (!line) return raw;
-
       if (line.startsWith("#EXT-X-KEY") || line.startsWith("#EXT-X-MAP")) {
         return line.replace(/URI="([^"]+)"/, (_m, uri) =>
           `URI="${buildProxiedUrl(workerOrigin, resolveUri(baseUrl, uri), ref)}"`
         );
       }
-
       if (line.startsWith("#")) return raw;
-
       return buildProxiedUrl(workerOrigin, resolveUri(baseUrl, line), ref);
     })
     .join("\n");
 }
 
-// Basic abuse guard: only proxy https sources, and only for
-// query-string-supplied targets (never same-worker recursion loops).
-function isAllowedTarget(url) {
-  return url.protocol === "https:";
+async function handlePlaybackProxy(request) {
+  const requestUrl = new URL(request.url);
+  const target = requestUrl.searchParams.get("url");
+  const ref = requestUrl.searchParams.get("ref");
+  const workerOrigin = requestUrl.origin;
+
+  if (!target) return json({ error: "MISSING_URL" }, 400);
+  let parsed;
+  try {
+    parsed = new URL(target);
+  } catch {
+    return json({ error: "INVALID_URL" }, 400);
+  }
+  if (parsed.protocol !== "https:") return json({ error: "INVALID_PROTOCOL" }, 400);
+
+  let upstream;
+  try {
+    upstream = await fetch(target, { headers: buildUpstreamHeaders(request, ref, request.headers.get("range")) });
+  } catch {
+    return json({ error: "UPSTREAM_UNREACHABLE" }, 502);
+  }
+  if (!upstream.ok && upstream.status !== 206) {
+    return json({ error: "UPSTREAM_FAILED", status: upstream.status }, upstream.status);
+  }
+
+  const contentType = upstream.headers.get("content-type") || "";
+  const looksLikePlaylist = target.includes(".m3u8") || contentType.includes("mpegurl");
+
+  if (looksLikePlaylist) {
+    const text = await upstream.text();
+    if (isM3u8Text(text)) {
+      return new Response(rewritePlaylist(text, target, ref, workerOrigin), {
+        headers: { "Content-Type": "application/vnd.apple.mpegurl", "Cache-Control": "no-store", ...CORS_HEADERS }
+      });
+    }
+    return new Response(text, { headers: { "Content-Type": contentType || "text/plain", ...CORS_HEADERS } });
+  }
+
+  const headers = { "Content-Type": contentType || "application/octet-stream", "Cache-Control": "no-store", ...CORS_HEADERS };
+  const contentLength = upstream.headers.get("content-length");
+  const contentRange = upstream.headers.get("content-range");
+  const acceptRanges = upstream.headers.get("accept-ranges");
+  if (contentLength) headers["Content-Length"] = contentLength;
+  if (contentRange) headers["Content-Range"] = contentRange;
+  if (acceptRanges) headers["Accept-Ranges"] = acceptRanges;
+
+  return new Response(upstream.body, { status: upstream.status, headers });
 }
+
+// ---------- mode 2: full-file HLS download (ordered streaming assembler) ----------
+
+// Fetches `items` with up to `concurrency` in flight, but enqueues
+// their bytes into the returned stream strictly in order — so a later
+// segment finishing before an earlier one never gets emitted out of
+// sequence, while still overlapping network latency across segments.
+function createOrderedStream(items, fetchOne) {
+  const concurrency = 6;
+  let nextToEmit = 0;
+  let nextToStart = 0;
+  let cancelled = false;
+  let failed = null;
+  const inFlight = new Map();
+  const completed = new Map();
+
+  function startMore() {
+    while (!cancelled && inFlight.size < concurrency && nextToStart < items.length) {
+      const idx = nextToStart++;
+      const p = fetchOne(items[idx])
+        .then((buf) => {
+          completed.set(idx, buf);
+        })
+        .catch((err) => {
+          failed = err;
+        })
+        .finally(() => {
+          inFlight.delete(idx);
+        });
+      inFlight.set(idx, p);
+    }
+  }
+
+  return new ReadableStream({
+    async pull(controller) {
+      startMore();
+      while (!failed && nextToEmit < items.length && !completed.has(nextToEmit)) {
+        const pending = [...inFlight.values()];
+        if (pending.length === 0) break; // shouldn't happen unless items.length === 0
+        await Promise.race(pending);
+        startMore();
+      }
+      if (failed) {
+        controller.error(failed);
+        return;
+      }
+      if (nextToEmit >= items.length) {
+        controller.close();
+        return;
+      }
+      const buf = completed.get(nextToEmit);
+      completed.delete(nextToEmit);
+      nextToEmit++;
+      controller.enqueue(new Uint8Array(buf));
+      startMore();
+    },
+    cancel() {
+      cancelled = true;
+    }
+  });
+}
+
+async function handleDownload(request) {
+  const params = new URL(request.url).searchParams;
+  const playlist = params.get("playlist");
+  const ref = params.get("ref");
+  const name = (params.get("name") || "video").replace(/["\r\n]/g, "");
+  const heightParam = params.get("height");
+  const targetHeight = heightParam ? Number(heightParam) : undefined;
+
+  if (!playlist) return json({ error: "MISSING_PLAYLIST" }, 400);
+  try {
+    if (new URL(playlist).protocol !== "https:") return json({ error: "INVALID_PROTOCOL" }, 400);
+  } catch {
+    return json({ error: "INVALID_URL" }, 400);
+  }
+
+  const upstreamHeaders = buildUpstreamHeaders(request, ref, null);
+
+  let rootText;
+  let mediaPlaylistUrl = playlist;
+  try {
+    const res = await fetch(playlist, { headers: upstreamHeaders });
+    if (!res.ok) return json({ error: "PLAYLIST_FETCH_FAILED", status: res.status }, res.status);
+    rootText = await res.text();
+  } catch {
+    return json({ error: "UPSTREAM_UNREACHABLE" }, 502);
+  }
+
+  if (isMasterPlaylist(rootText)) {
+    const variants = parseMasterPlaylist(rootText, playlist);
+    if (!variants.length) return json({ error: "NO_VARIANTS_FOUND" }, 422);
+    const chosen = targetHeight
+      ? variants.reduce((best, v) =>
+          Math.abs((v.height ?? 0) - targetHeight) < Math.abs((best.height ?? 0) - targetHeight) ? v : best
+        )
+      : variants.reduce((best, v) => (v.bandwidth > best.bandwidth ? v : best));
+    mediaPlaylistUrl = chosen.uri;
+    try {
+      const mres = await fetch(mediaPlaylistUrl, { headers: upstreamHeaders });
+      if (!mres.ok) return json({ error: "PLAYLIST_FETCH_FAILED", status: mres.status }, mres.status);
+      rootText = await mres.text();
+    } catch {
+      return json({ error: "UPSTREAM_UNREACHABLE" }, 502);
+    }
+  }
+
+  const { segments, mapUri } = parseMediaPlaylist(rootText, mediaPlaylistUrl);
+  if (!segments.length) return json({ error: "NO_SEGMENTS_FOUND" }, 422);
+  for (const seg of segments) {
+    if (seg.key && seg.key.method !== "AES-128") return json({ error: "ENCRYPTED_STREAM_UNSUPPORTED" }, 422);
+  }
+
+  const keyCache = new Map();
+  async function getAesKey(keyUri) {
+    let p = keyCache.get(keyUri);
+    if (!p) {
+      p = fetch(keyUri, { headers: upstreamHeaders })
+        .then((r) => r.arrayBuffer())
+        .then((buf) => crypto.subtle.importKey("raw", buf, { name: "AES-CBC" }, false, ["decrypt"]));
+      keyCache.set(keyUri, p);
+    }
+    return p;
+  }
+
+  async function fetchItem(item) {
+    const res = await fetch(item.uri, { headers: upstreamHeaders });
+    if (!res.ok) throw new Error(`SEGMENT_FETCH_FAILED_${res.status}`);
+    const buf = await res.arrayBuffer();
+    if (!item.key) return buf;
+    const aesKey = await getAesKey(item.key.keyUri);
+    const iv = item.key.ivHex ? hexToBytes(item.key.ivHex) : sequenceToIv(item.sequence);
+    return crypto.subtle.decrypt({ name: "AES-CBC", iv }, aesKey, buf);
+  }
+
+  const items = mapUri ? [{ uri: mapUri, key: null, sequence: -1 }, ...segments] : segments;
+  const container = mapUri ? "mp4" : "ts";
+  const stream = createOrderedStream(items, fetchItem);
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": container === "mp4" ? "video/mp4" : "video/mp2t",
+      "Content-Disposition": `attachment; filename="${name}.${container}"`,
+      "Cache-Control": "no-store",
+      ...CORS_HEADERS
+    }
+  });
+}
+
+// ---------- entry point ----------
 
 export default {
   async fetch(request) {
-    const requestUrl = new URL(request.url);
-    const target = requestUrl.searchParams.get("url");
-    const ref = requestUrl.searchParams.get("ref");
-    const workerOrigin = requestUrl.origin;
+    const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
-          "Access-Control-Allow-Origin": "*",
+          ...CORS_HEADERS,
           "Access-Control-Allow-Methods": "GET, OPTIONS",
           "Access-Control-Allow-Headers": "Range"
         }
       });
     }
 
-    if (!target) {
-      return new Response(JSON.stringify({ error: "MISSING_URL" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
-    let parsed;
-    try {
-      parsed = new URL(target);
-    } catch {
-      return new Response(JSON.stringify({ error: "INVALID_URL" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-    if (!isAllowedTarget(parsed)) {
-      return new Response(JSON.stringify({ error: "INVALID_PROTOCOL" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
-    const range = request.headers.get("range");
-    const upstreamHeaders = {
-      "User-Agent": request.headers.get("user-agent") || "Mozilla/5.0"
-    };
-    if (ref) {
-      upstreamHeaders["Referer"] = ref;
-      try {
-        upstreamHeaders["Origin"] = new URL(ref).origin;
-      } catch {
-        /* ignore */
-      }
-    }
-    if (range) upstreamHeaders["Range"] = range;
-
-    let upstream;
-    try {
-      upstream = await fetch(target, { headers: upstreamHeaders });
-    } catch {
-      return new Response(JSON.stringify({ error: "UPSTREAM_UNREACHABLE" }), {
-        status: 502,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
-    if (!upstream.ok && upstream.status !== 206) {
-      return new Response(JSON.stringify({ error: "UPSTREAM_FAILED", status: upstream.status }), {
-        status: upstream.status,
-        headers: { "Content-Type": "application/json" }
-      });
-    }
-
-    const contentType = upstream.headers.get("content-type") || "";
-    const looksLikePlaylist = target.includes(".m3u8") || contentType.includes("mpegurl");
-    const corsHeaders = { "Access-Control-Allow-Origin": "*" };
-
-    if (looksLikePlaylist) {
-      const text = await upstream.text();
-      if (isM3u8Text(text)) {
-        const rewritten = rewritePlaylist(text, target, ref, workerOrigin);
-        return new Response(rewritten, {
-          headers: {
-            "Content-Type": "application/vnd.apple.mpegurl",
-            "Cache-Control": "no-store",
-            ...corsHeaders
-          }
-        });
-      }
-      return new Response(text, {
-        headers: { "Content-Type": contentType || "text/plain", ...corsHeaders }
-      });
-    }
-
-    const headers = {
-      "Content-Type": contentType || "application/octet-stream",
-      "Cache-Control": "no-store",
-      ...corsHeaders
-    };
-    const contentLength = upstream.headers.get("content-length");
-    const contentRange = upstream.headers.get("content-range");
-    const acceptRanges = upstream.headers.get("accept-ranges");
-    if (contentLength) headers["Content-Length"] = contentLength;
-    if (contentRange) headers["Content-Range"] = contentRange;
-    if (acceptRanges) headers["Accept-Ranges"] = acceptRanges;
-
-    return new Response(upstream.body, { status: upstream.status, headers });
+    if (url.pathname === "/download") return handleDownload(request);
+    return handlePlaybackProxy(request);
   }
 };

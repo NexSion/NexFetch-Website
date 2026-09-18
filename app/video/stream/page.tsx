@@ -205,23 +205,45 @@ export default function StreamPage() {
       }
 
       if (isM3u8(payload.url)) {
-        const { resolvePlayableUrl } = await import("@/lib/streamProxy");
-        const playlistUrl = await resolvePlayableUrl(payload);
-        const { blob, container } = await downloadHls(playlistUrl, { onProgress: setDownloadProgress });
-        const ext = container === "mp4" ? "mp4" : "ts";
-        const blobUrl = URL.createObjectURL(blob);
-        const fullName = `${finalName}.${ext}`;
+        const { buildDownloadUrl, resolvePlayableUrl } = await import("@/lib/streamProxy");
+        const proxiedDownloadUrl = buildDownloadUrl(payload, finalName);
 
-        const bridge = tabId ? new ExtensionBridge(tabId) : null;
-        if (bridge?.available) {
-          const result = await bridge.sendHlsBlob(blobUrl, fullName);
-          bridge.close();
-          if (!result.success) throw new Error(result.reason ?? "EXTENSION_SAVE_FAILED");
+        if (proxiedDownloadUrl) {
+          // Worker assembles + AES-128-decrypts the whole file server-side
+          // and streams it back as one ordinary attachment — no blob
+          // built in the page, no cross-context message that can time
+          // out on an idle tab.
+          const bridge = tabId ? new ExtensionBridge(tabId) : null;
+          if (bridge?.available) {
+            await bridge.startDownload(proxiedDownloadUrl, `${finalName}.ts`);
+            bridge.close();
+          } else {
+            const a = document.createElement("a");
+            a.href = proxiedDownloadUrl;
+            a.download = `${finalName}.ts`;
+            a.click();
+          }
+          setDownloadProgress(1);
         } else {
-          const a = document.createElement("a");
-          a.href = blobUrl;
-          a.download = fullName;
-          a.click();
+          // No Worker configured (NEXT_PUBLIC_STREAM_PROXY_BASE unset) —
+          // fall back to the older client-side assemble-then-hand-off path.
+          const playlistUrl = await resolvePlayableUrl(payload);
+          const { blob, container } = await downloadHls(playlistUrl, { onProgress: setDownloadProgress });
+          const ext = container === "mp4" ? "mp4" : "ts";
+          const blobUrl = URL.createObjectURL(blob);
+          const fullName = `${finalName}.${ext}`;
+
+          const bridge = tabId ? new ExtensionBridge(tabId) : null;
+          if (bridge?.available) {
+            const result = await bridge.sendHlsBlob(blobUrl, fullName);
+            bridge.close();
+            if (!result.success) throw new Error(result.reason ?? "EXTENSION_SAVE_FAILED");
+          } else {
+            const a = document.createElement("a");
+            a.href = blobUrl;
+            a.download = fullName;
+            a.click();
+          }
         }
       } else {
         const fullName = `${finalName}.mp4`;

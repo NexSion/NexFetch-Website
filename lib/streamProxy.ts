@@ -63,3 +63,27 @@ export async function resolvePlayableUrl(
   }
   return targetUrl;
 }
+
+export function proxyConfigured(): boolean {
+  return proxyBase() !== null;
+}
+
+// Full-file HLS download, assembled server-side by the Worker (fetches
+// + AES-128-decrypts every segment itself, streams the result back as
+// one ordinary attachment). Always routed through the Worker rather
+// than probed direct-first like playback — the heavy per-segment work
+// belongs on Cloudflare's bandwidth either way, and this sidesteps the
+// client-side blob/bridge-messaging path that timed out on idle tabs.
+export function buildDownloadUrl(
+  payload: { url: string; source_url?: string | null },
+  filename: string,
+  targetHeight?: number
+): string | null {
+  const base = proxyBase();
+  if (!base) return null;
+  const params = new URLSearchParams({ playlist: payload.url, name: filename });
+  const ref = refererFor(payload);
+  if (ref) params.set("ref", ref);
+  if (targetHeight) params.set("height", String(targetHeight));
+  return `${base}/download?${params.toString()}`;
+}
