@@ -209,20 +209,19 @@ export default function StreamPage() {
         const proxiedDownloadUrl = buildDownloadUrl(payload, finalName);
 
         if (proxiedDownloadUrl) {
-          // Worker assembles + AES-128-decrypts the whole file server-side
-          // and streams it back as one ordinary attachment — no blob
-          // built in the page, no cross-context message that can time
-          // out on an idle tab.
-          const bridge = tabId ? new ExtensionBridge(tabId) : null;
-          if (bridge?.available) {
-            await bridge.startDownload(proxiedDownloadUrl, `${finalName}.ts`);
-            bridge.close();
-          } else {
-            const a = document.createElement("a");
-            a.href = proxiedDownloadUrl;
-            a.download = `${finalName}.ts`;
-            a.click();
-          }
+          // A real server URL (not a blob:) — the browser's own download
+          // manager can save this directly, no extension mediation
+          // needed at all. (The extension bridge would also work in
+          // principle, but only if its content script actually got
+          // injected on this exact URL shape — see the note in
+          // manifest.json about the /video/stream/* match pattern still
+          // expecting a trailing-slash path segment this flat route
+          // doesn't have. Skipping the bridge here sidesteps that
+          // entirely rather than depending on it.)
+          const a = document.createElement("a");
+          a.href = proxiedDownloadUrl;
+          a.download = `${finalName}.ts`;
+          a.click();
           setDownloadProgress(1);
         } else {
           // No Worker configured (NEXT_PUBLIC_STREAM_PROXY_BASE unset) —
