@@ -205,24 +205,22 @@ export default function StreamPage() {
       }
 
       if (isM3u8(payload.url)) {
-        const { buildDownloadUrl, resolvePlayableUrl } = await import("@/lib/streamProxy");
-        const proxiedDownloadUrl = buildDownloadUrl(payload, finalName);
+        const [{ proxyConfigured, resolvePlayableUrl }, { downloadHlsChunked, DownloadCancelledError }] =
+          await Promise.all([import("@/lib/streamProxy"), import("@/lib/chunkedDownload")]);
 
-        if (proxiedDownloadUrl) {
-          // A real server URL (not a blob:) — the browser's own download
-          // manager can save this directly, no extension mediation
-          // needed at all. (The extension bridge would also work in
-          // principle, but only if its content script actually got
-          // injected on this exact URL shape — see the note in
-          // manifest.json about the /video/stream/* match pattern still
-          // expecting a trailing-slash path segment this flat route
-          // doesn't have. Skipping the bridge here sidesteps that
-          // entirely rather than depending on it.)
-          const a = document.createElement("a");
-          a.href = proxiedDownloadUrl;
-          a.download = `${finalName}.ts`;
-          a.click();
-          setDownloadProgress(1);
+        if (proxyConfigured()) {
+          // Chunked, Worker-assembled + AES-128-decrypted download — see
+          // lib/chunkedDownload.ts for why this is many small calls
+          // rather than one (Cloudflare Workers free-plan subrequest cap).
+          try {
+            await downloadHlsChunked(payload, finalName, undefined, setDownloadProgress);
+          } catch (err) {
+            if (err instanceof DownloadCancelledError) {
+              setDownloadState("idle");
+              return;
+            }
+            throw err;
+          }
         } else {
           // No Worker configured (NEXT_PUBLIC_STREAM_PROXY_BASE unset) —
           // fall back to the older client-side assemble-then-hand-off path.

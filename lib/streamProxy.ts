@@ -74,6 +74,12 @@ export function proxyConfigured(): boolean {
 // than probed direct-first like playback — the heavy per-segment work
 // belongs on Cloudflare's bandwidth either way, and this sidesteps the
 // client-side blob/bridge-messaging path that timed out on idle tabs.
+//
+// NOTE: only viable for short clips — Cloudflare Workers' free plan
+// caps a single invocation at 50 subrequests, so a long video's
+// segment count blows past that and the stream cuts off mid-file. For
+// anything past a handful of segments, use buildDownloadRangeUrl
+// (chunked) instead — see downloadHlsChunked in the stream page.
 export function buildDownloadUrl(
   payload: { url: string; source_url?: string | null },
   filename: string,
@@ -86,4 +92,27 @@ export function buildDownloadUrl(
   if (ref) params.set("ref", ref);
   if (targetHeight) params.set("height", String(targetHeight));
   return `${base}/download?${params.toString()}`;
+}
+
+// One bounded-size slice of the video (≤40 segments server-side) — free
+// -plan-friendly, since each call is its own Worker invocation well
+// under the 50-subrequest cap. The caller loops start=0,40,80,... until
+// it's covered every segment (X-Total-Segments tells it when to stop).
+export function buildDownloadRangeUrl(
+  payload: { url: string; source_url?: string | null },
+  start: number,
+  count: number,
+  targetHeight?: number
+): string | null {
+  const base = proxyBase();
+  if (!base) return null;
+  const params = new URLSearchParams({
+    playlist: payload.url,
+    start: String(start),
+    count: String(count)
+  });
+  const ref = refererFor(payload);
+  if (ref) params.set("ref", ref);
+  if (targetHeight) params.set("height", String(targetHeight));
+  return `${base}/download-range?${params.toString()}`;
 }

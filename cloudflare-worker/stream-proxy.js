@@ -168,6 +168,10 @@ function json(body, status) {
 }
 
 const CORS_HEADERS = { "Access-Control-Allow-Origin": "*" };
+const CHUNK_CORS_HEADERS = {
+  ...CORS_HEADERS,
+  "Access-Control-Expose-Headers": "X-Total-Segments, X-Container, X-Range-Start, X-Range-Count"
+};
 
 // ---------- mode 1: playback proxy (single resource, playlist-rewriting) ----------
 
@@ -391,6 +395,120 @@ async function handleDownload(request) {
   });
 }
 
+// ---------- mode 3: chunked download (free-plan friendly) ----------
+//
+// Cloudflare Workers on the Free plan are hard-capped at 50 external
+// subrequests per invocation — a 2h+ HLS video can have 500-1000+
+// segments, so a single /download call (mode 2 above) simply gets cut
+// off mid-file once it hits that cap. Free-plan-friendly answer: split
+// the work across many small invocations instead of one huge one. The
+// client calls this endpoint repeatedly with a `start`/`count` window
+// (count capped server-side well under 50), and stitches the chunks
+// together itself — either straight to disk via the File System Access
+// API (no memory ceiling) or, as a fallback, into one Blob at the end.
+
+const MAX_CHUNK_SEGMENTS = 40;
+
+async function handleDownloadRange(request) {
+  const params = new URL(request.url).searchParams;
+  const playlist = params.get("playlist");
+  const ref = params.get("ref");
+  const heightParam = params.get("height");
+  const targetHeight = heightParam ? Number(heightParam) : undefined;
+  const start = Math.max(0, Number(params.get("start") ?? "0") || 0);
+  const requestedCount = Number(params.get("count") ?? String(MAX_CHUNK_SEGMENTS)) || MAX_CHUNK_SEGMENTS;
+  const count = Math.min(Math.max(1, requestedCount), MAX_CHUNK_SEGMENTS);
+
+  if (!playlist) return json({ error: "MISSING_PLAYLIST" }, 400);
+  try {
+    if (new URL(playlist).protocol !== "https:") return json({ error: "INVALID_PROTOCOL" }, 400);
+  } catch {
+    return json({ error: "INVALID_URL" }, 400);
+  }
+
+  const upstreamHeaders = buildUpstreamHeaders(request, ref, null);
+
+  let rootText;
+  let mediaPlaylistUrl = playlist;
+  try {
+    const res = await fetch(playlist, { headers: upstreamHeaders });
+    if (!res.ok) return json({ error: "PLAYLIST_FETCH_FAILED", status: res.status }, res.status);
+    rootText = await res.text();
+  } catch {
+    return json({ error: "UPSTREAM_UNREACHABLE" }, 502);
+  }
+
+  if (isMasterPlaylist(rootText)) {
+    const variants = parseMasterPlaylist(rootText, playlist);
+    if (!variants.length) return json({ error: "NO_VARIANTS_FOUND" }, 422);
+    const chosen = targetHeight
+      ? variants.reduce((best, v) =>
+          Math.abs((v.height ?? 0) - targetHeight) < Math.abs((best.height ?? 0) - targetHeight) ? v : best
+        )
+      : variants.reduce((best, v) => (v.bandwidth > best.bandwidth ? v : best));
+    mediaPlaylistUrl = chosen.uri;
+    try {
+      const mres = await fetch(mediaPlaylistUrl, { headers: upstreamHeaders });
+      if (!mres.ok) return json({ error: "PLAYLIST_FETCH_FAILED", status: mres.status }, mres.status);
+      rootText = await mres.text();
+    } catch {
+      return json({ error: "UPSTREAM_UNREACHABLE" }, 502);
+    }
+  }
+
+  const { segments, mapUri } = parseMediaPlaylist(rootText, mediaPlaylistUrl);
+  if (!segments.length) return json({ error: "NO_SEGMENTS_FOUND" }, 422);
+  for (const seg of segments) {
+    if (seg.key && seg.key.method !== "AES-128") return json({ error: "ENCRYPTED_STREAM_UNSUPPORTED" }, 422);
+  }
+
+  const container = mapUri ? "mp4" : "ts";
+  const rangeSegments = segments.slice(start, start + count);
+  if (start < segments.length && rangeSegments.length === 0) {
+    return json({ error: "EMPTY_RANGE" }, 422);
+  }
+
+  const keyCache = new Map();
+  async function getAesKey(keyUri) {
+    let p = keyCache.get(keyUri);
+    if (!p) {
+      p = fetch(keyUri, { headers: upstreamHeaders })
+        .then((r) => r.arrayBuffer())
+        .then((buf) => crypto.subtle.importKey("raw", buf, { name: "AES-CBC" }, false, ["decrypt"]));
+      keyCache.set(keyUri, p);
+    }
+    return p;
+  }
+
+  async function fetchItem(item) {
+    const res = await fetch(item.uri, { headers: upstreamHeaders });
+    if (!res.ok) throw new Error(`SEGMENT_FETCH_FAILED_${res.status}`);
+    const buf = await res.arrayBuffer();
+    if (!item.key) return buf;
+    const aesKey = await getAesKey(item.key.keyUri);
+    const iv = item.key.ivHex ? hexToBytes(item.key.ivHex) : sequenceToIv(item.sequence);
+    return crypto.subtle.decrypt({ name: "AES-CBC", iv }, aesKey, buf);
+  }
+
+  // The fMP4 init segment (EXT-X-MAP) isn't part of the numbered
+  // segment list, so it only rides along with chunk 0 — not counted
+  // against `count`, never re-sent on later chunks.
+  const items = start === 0 && mapUri ? [{ uri: mapUri, key: null, sequence: -1 }, ...rangeSegments] : rangeSegments;
+  const stream = createOrderedStream(items, fetchItem);
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": container === "mp4" ? "video/mp4" : "video/mp2t",
+      "Cache-Control": "no-store",
+      "X-Total-Segments": String(segments.length),
+      "X-Container": container,
+      "X-Range-Start": String(start),
+      "X-Range-Count": String(rangeSegments.length),
+      ...CHUNK_CORS_HEADERS
+    }
+  });
+}
+
 // ---------- entry point ----------
 
 export default {
@@ -408,6 +526,7 @@ export default {
     }
 
     if (url.pathname === "/download") return handleDownload(request);
+    if (url.pathname === "/download-range") return handleDownloadRange(request);
     return handlePlaybackProxy(request);
   }
 };
