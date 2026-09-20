@@ -15,8 +15,33 @@ import { buildDownloadRangeUrl } from "@/lib/streamProxy";
 //  - Everywhere else: buffers chunks in memory and assembles one Blob
 //    at the end, then triggers a normal <a download> — fine for more
 //    modest file sizes, but large videos may hit browser memory limits.
+//
+// Each chunk fetch retries a few times before giving up — a single
+// mid-download network blip (or interference from an unrelated browser
+// extension sharing the page) shouldn't have to fail the whole file.
 
 const CHUNK_SEGMENTS = 40;
+const MAX_ATTEMPTS = 4;
+const RETRY_DELAY_MS = 1200;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchChunkWithRetry(url: string): Promise<Response> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (res.ok && res.body) return res;
+      lastErr = new Error(`SEGMENT_FETCH_FAILED_${res.status}`);
+    } catch (err) {
+      lastErr = err;
+    }
+    if (attempt < MAX_ATTEMPTS) await sleep(RETRY_DELAY_MS * attempt);
+  }
+  throw lastErr instanceof Error ? lastErr : new Error("SEGMENT_FETCH_FAILED");
+}
 
 type FsWindow = Window & {
   showSaveFilePicker?: (options: {
@@ -48,10 +73,7 @@ export async function downloadHlsChunked(
   const firstUrl = buildDownloadRangeUrl(payload, 0, CHUNK_SEGMENTS, targetHeight);
   if (!firstUrl) throw new Error("PROXY_NOT_CONFIGURED");
 
-  const first = await fetch(firstUrl);
-  if (!first.ok || !first.body) {
-    throw new Error(`SEGMENT_FETCH_FAILED_${first.status}`);
-  }
+  const first = await fetchChunkWithRetry(firstUrl);
 
   const total = Number(first.headers.get("X-Total-Segments") ?? "0");
   const container = first.headers.get("X-Container") === "mp4" ? "mp4" : "ts";
@@ -84,16 +106,15 @@ export async function downloadHlsChunked(
 
     const fileWritable = await fileHandle.createWritable();
 
-    await first.body.pipeTo(fileWritable, { preventClose: true });
+    await first.body!.pipeTo(fileWritable, { preventClose: true });
     let start = firstCount;
     onProgress(start / total);
 
     while (start < total) {
       const url = buildDownloadRangeUrl(payload, start, CHUNK_SEGMENTS, targetHeight);
       if (!url) throw new Error("PROXY_NOT_CONFIGURED");
-      const res = await fetch(url);
-      if (!res.ok || !res.body) throw new Error(`SEGMENT_FETCH_FAILED_${res.status}`);
-      await res.body.pipeTo(fileWritable, { preventClose: true });
+      const res = await fetchChunkWithRetry(url);
+      await res.body!.pipeTo(fileWritable, { preventClose: true });
       const returned = Number(res.headers.get("X-Range-Count") ?? String(CHUNK_SEGMENTS)) || CHUNK_SEGMENTS;
       start += returned;
       onProgress(Math.min(start / total, 1));
@@ -111,8 +132,7 @@ export async function downloadHlsChunked(
   while (start < total) {
     const url = buildDownloadRangeUrl(payload, start, CHUNK_SEGMENTS, targetHeight);
     if (!url) throw new Error("PROXY_NOT_CONFIGURED");
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`SEGMENT_FETCH_FAILED_${res.status}`);
+    const res = await fetchChunkWithRetry(url);
     parts.push(await res.arrayBuffer());
     const returned = Number(res.headers.get("X-Range-Count") ?? String(CHUNK_SEGMENTS)) || CHUNK_SEGMENTS;
     start += returned;

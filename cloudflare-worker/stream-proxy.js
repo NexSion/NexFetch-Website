@@ -164,7 +164,10 @@ function buildUpstreamHeaders(request, ref, range) {
 }
 
 function json(body, status) {
-  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+  });
 }
 
 const CORS_HEADERS = { "Access-Control-Allow-Origin": "*" };
