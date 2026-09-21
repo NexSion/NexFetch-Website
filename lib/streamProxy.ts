@@ -116,3 +116,13 @@ export function buildDownloadRangeUrl(
   if (targetHeight) params.set("height", String(targetHeight));
   return `${base}/download-range?${params.toString()}`;
 }
+
+// POST endpoint for lean batch fetching (see lib/chunkedDownload.ts):
+// the browser parses the playlist itself and hands this endpoint an
+// already-resolved list of segment URLs — no playlist re-parsing on
+// the Worker, which is what made /download-range's per-chunk CPU cost
+// unpredictable on the Workers free plan's 10ms-CPU-per-invocation cap.
+export function fetchBatchEndpoint(): string | null {
+  const base = proxyBase();
+  return base ? `${base}/fetch-batch` : null;
+}

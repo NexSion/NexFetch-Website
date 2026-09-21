@@ -32,7 +32,7 @@ export interface HlsDownloadResult {
 
 export type ProgressCallback = (fraction: number) => void;
 
-function resolveUrl(base: string, ref: string): string {
+export function resolveUrl(base: string, ref: string): string {
   try {
     return new URL(ref, base).toString();
   } catch {
@@ -40,26 +40,26 @@ function resolveUrl(base: string, ref: string): string {
   }
 }
 
-interface KeyState {
+export interface KeyState {
   method: string;
   keyUri: string;
   ivHex: string | null; // explicit IV attribute, if present (without 0x)
 }
 
-interface ParsedSegment {
+export interface ParsedSegment {
   uri: string;
   sequence: number;
   key: KeyState | null;
 }
 
-interface MediaPlaylist {
+export interface MediaPlaylist {
   segments: ParsedSegment[];
   mapUri: string | null;
 }
 
 const SUPPORTED_ENCRYPTED_METHODS = new Set(["AES-128"]);
 
-function parseMediaPlaylist(text: string, baseUrl: string): MediaPlaylist {
+export function parseMediaPlaylist(text: string, baseUrl: string): MediaPlaylist {
   const lines = text.split("\n").map((l) => l.trim());
   const segments: ParsedSegment[] = [];
   let mapUri: string | null = null;
@@ -112,13 +112,13 @@ function parseMediaPlaylist(text: string, baseUrl: string): MediaPlaylist {
   return { segments, mapUri };
 }
 
-interface MasterVariant {
+export interface MasterVariant {
   uri: string;
   bandwidth: number;
   height?: number;
 }
 
-function parseMasterPlaylist(text: string, baseUrl: string): MasterVariant[] {
+export function parseMasterPlaylist(text: string, baseUrl: string): MasterVariant[] {
   const lines = text.split("\n").map((l) => l.trim());
   const variants: MasterVariant[] = [];
 
@@ -140,7 +140,7 @@ function parseMasterPlaylist(text: string, baseUrl: string): MasterVariant[] {
   return variants;
 }
 
-function isMasterPlaylist(text: string): boolean {
+export function isMasterPlaylist(text: string): boolean {
   return text.includes("#EXT-X-STREAM-INF");
 }
 

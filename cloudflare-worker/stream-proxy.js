@@ -512,6 +512,75 @@ async function handleDownloadRange(request) {
   });
 }
 
+// ---------- mode 4: lean batch fetch (playlist parsed client-side) ----------
+//
+// /download-range (mode 3) still re-fetches and re-parses the *entire*
+// playlist on every single chunk call, and for a long VOD playlist
+// (hundreds of lines, regex per line) that parsing work itself is real
+// CPU time — on top of N segment fetches and their AES-128 decrypts.
+// Free-plan Workers get just 10ms of *CPU* time per invocation (fetch
+// I/O wait doesn't count against that, but JS execution does), and
+// repeating full-playlist parsing on every chunk is exactly the kind
+// of redundant work that blows through it — inconsistently, since it
+// depends on playlist size and how much decrypt work lands in the same
+// invocation. This mode removes that redundancy entirely: the browser
+// (no CPU-time limit) fetches+parses the playlist *once*, then just
+// hands this endpoint an already-resolved list of segment (and key)
+// URLs to fetch and decrypt — no parsing here at all.
+//
+// POST /fetch-batch  { items: [{ uri, sequence, key: {method,keyUri,ivHex}|null }], ref }
+// Response: raw concatenated (decrypted) bytes for that batch, in order.
+
+async function handleFetchBatch(request) {
+  if (request.method !== "POST") return json({ error: "METHOD_NOT_ALLOWED" }, 405);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "INVALID_BODY" }, 400);
+  }
+
+  const items = Array.isArray(body?.items) ? body.items : null;
+  const ref = typeof body?.ref === "string" ? body.ref : null;
+  if (!items || items.length === 0) return json({ error: "MISSING_ITEMS" }, 400);
+  if (items.length > 45) return json({ error: "TOO_MANY_ITEMS" }, 400);
+  for (const item of items) {
+    if (typeof item?.uri !== "string") return json({ error: "INVALID_ITEM" }, 400);
+    if (item.key && item.key.method !== "AES-128") return json({ error: "ENCRYPTED_STREAM_UNSUPPORTED" }, 422);
+  }
+
+  const upstreamHeaders = buildUpstreamHeaders(request, ref, null);
+
+  const keyCache = new Map();
+  async function getAesKey(keyUri) {
+    let p = keyCache.get(keyUri);
+    if (!p) {
+      p = fetch(keyUri, { headers: upstreamHeaders })
+        .then((r) => r.arrayBuffer())
+        .then((buf) => crypto.subtle.importKey("raw", buf, { name: "AES-CBC" }, false, ["decrypt"]));
+      keyCache.set(keyUri, p);
+    }
+    return p;
+  }
+
+  async function fetchItem(item) {
+    const res = await fetch(item.uri, { headers: upstreamHeaders });
+    if (!res.ok) throw new Error(`SEGMENT_FETCH_FAILED_${res.status}`);
+    const buf = await res.arrayBuffer();
+    if (!item.key) return buf;
+    const aesKey = await getAesKey(item.key.keyUri);
+    const iv = item.key.ivHex ? hexToBytes(item.key.ivHex) : sequenceToIv(item.sequence ?? 0);
+    return crypto.subtle.decrypt({ name: "AES-CBC", iv }, aesKey, buf);
+  }
+
+  const stream = createOrderedStream(items, fetchItem);
+
+  return new Response(stream, {
+    headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store", ...CORS_HEADERS }
+  });
+}
+
 // ---------- entry point ----------
 
 export default {
@@ -522,14 +591,15 @@ export default {
       return new Response(null, {
         headers: {
           ...CORS_HEADERS,
-          "Access-Control-Allow-Methods": "GET, OPTIONS",
-          "Access-Control-Allow-Headers": "Range"
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Range, Content-Type"
         }
       });
     }
 
     if (url.pathname === "/download") return handleDownload(request);
     if (url.pathname === "/download-range") return handleDownloadRange(request);
+    if (url.pathname === "/fetch-batch") return handleFetchBatch(request);
     return handlePlaybackProxy(request);
   }
 };
