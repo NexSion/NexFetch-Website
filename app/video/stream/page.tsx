@@ -5,6 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { decodeDataParam } from "@/lib/dataParam";
 import { ExtensionBridge } from "@/lib/bridge";
 import { downloadHls } from "@/lib/hlsDownload";
+import { refererFor } from "@/lib/streamProxy";
 import { formatBytes, formatDuration } from "@/lib/format";
 import GlassCard from "@/components/GlassCard";
 
@@ -14,7 +15,24 @@ import GlassCard from "@/components/GlassCard";
 // does NOT ask this page to look a video up by id — it base64-encodes
 // the whole payload into `data` up front. `id` and `dkey` ride along
 // only so this page can talk back to the extension (via the
-// BroadcastChannel bridge) for the actual download/blob-save step.
+// BroadcastChannel bridge) for the actual download/blob-save step —
+// and even that is optional: if no extension is present on this tab,
+// downloads still work as a plain browser download, no extension
+// required.
+//
+// Download strategy (website-only, no extension dependency): every
+// HLS download goes through lib/hlsDownload.ts's downloadHls(), which
+// parses the playlist and decrypts AES-128 segments entirely in the
+// browser, routing individual fetches through the Cloudflare Worker's
+// lean relay (cloudflare-worker/stream-proxy.js, mode 1) only for
+// hosts that actually reject a direct browser fetch (Referer/hotlink
+// protection — confirmed against a real Bunny Stream 403 via
+// devtools). The Worker never does the AES decryption itself anymore
+// (that used to happen in a separate /fetch-batch batch-decrypt mode,
+// removed from this flow — see lib/chunkedDownload.ts's file header
+// for why: Cloudflare Workers' free-plan CPU-time cap could silently
+// truncate a batch mid-decrypt). Decryption has no such limit in the
+// browser, so this is both simpler and more reliable.
 interface StreamPayload {
   url: string;
   source_url?: string | null;
@@ -205,42 +223,28 @@ export default function StreamPage() {
       }
 
       if (isM3u8(payload.url)) {
-        const [{ proxyConfigured, resolvePlayableUrl }, { downloadHlsChunked, DownloadCancelledError }] =
-          await Promise.all([import("@/lib/streamProxy"), import("@/lib/chunkedDownload")]);
+        const { blob, container } = await downloadHls(payload.url, {
+          onProgress: setDownloadProgress,
+          refererUrl: refererFor(payload)
+        });
+        const ext = container === "mp4" ? "mp4" : "ts";
+        const blobUrl = URL.createObjectURL(blob);
+        const fullName = `${finalName}.${ext}`;
 
-        if (proxyConfigured()) {
-          // Chunked, Worker-assembled + AES-128-decrypted download — see
-          // lib/chunkedDownload.ts for why this is many small calls
-          // rather than one (Cloudflare Workers free-plan subrequest cap).
-          try {
-            await downloadHlsChunked(payload, finalName, undefined, setDownloadProgress);
-          } catch (err) {
-            if (err instanceof DownloadCancelledError) {
-              setDownloadState("idle");
-              return;
-            }
-            throw err;
-          }
+        // Extension isn't required — if one happens to be on this tab
+        // we let it save via chrome.downloads (skips the browser's own
+        // save dialog); otherwise a plain <a download> works exactly
+        // the same from the user's point of view.
+        const bridge = tabId ? new ExtensionBridge(tabId) : null;
+        if (bridge?.available) {
+          const result = await bridge.sendHlsBlob(blobUrl, fullName);
+          bridge.close();
+          if (!result.success) throw new Error(result.reason ?? "EXTENSION_SAVE_FAILED");
         } else {
-          // No Worker configured (NEXT_PUBLIC_STREAM_PROXY_BASE unset) —
-          // fall back to the older client-side assemble-then-hand-off path.
-          const playlistUrl = await resolvePlayableUrl(payload);
-          const { blob, container } = await downloadHls(playlistUrl, { onProgress: setDownloadProgress });
-          const ext = container === "mp4" ? "mp4" : "ts";
-          const blobUrl = URL.createObjectURL(blob);
-          const fullName = `${finalName}.${ext}`;
-
-          const bridge = tabId ? new ExtensionBridge(tabId) : null;
-          if (bridge?.available) {
-            const result = await bridge.sendHlsBlob(blobUrl, fullName);
-            bridge.close();
-            if (!result.success) throw new Error(result.reason ?? "EXTENSION_SAVE_FAILED");
-          } else {
-            const a = document.createElement("a");
-            a.href = blobUrl;
-            a.download = fullName;
-            a.click();
-          }
+          const a = document.createElement("a");
+          a.href = blobUrl;
+          a.download = fullName;
+          a.click();
         }
       } else {
         const fullName = `${finalName}.mp4`;

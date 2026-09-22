@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import { ExtensionBridge, type VideoLinkData } from "@/lib/bridge";
 import { downloadHls } from "@/lib/hlsDownload";
+import { refererFor } from "@/lib/streamProxy";
 import { formatBytes, formatDuration } from "@/lib/format";
 import GlassCard from "@/components/GlassCard";
 
@@ -204,6 +205,16 @@ export default function StreamPage() {
   }, [speed]);
 
   // ---- download ----
+  // Downloads never require the extension: downloadHls() (see
+  // lib/hlsDownload.ts) does everything in the browser — playlist
+  // parse, per-segment fetch (proxied through the Cloudflare Worker's
+  // lean relay only for hosts that reject a direct fetch, e.g. Bunny
+  // Stream Referer allow-lists), and AES-128 decrypt via Web Crypto.
+  // If an extension happens to be on this tab we still hand the
+  // finished blob to it so it can save via chrome.downloads (skips
+  // the browser's own save dialog) — but that's an optional nicety,
+  // not a requirement; the plain <a download> fallback below works
+  // identically without one.
   async function handleDownload() {
     if (!videoData) return;
     setDownloadState("downloading");
@@ -217,7 +228,8 @@ export default function StreamPage() {
         const { blob, container } = await downloadHls(videoData.url, {
           headers: videoData.headers,
           targetHeight: videoData.height,
-          onProgress: setDownloadProgress
+          onProgress: setDownloadProgress,
+          refererUrl: refererFor({ url: videoData.url, source_url: videoData.webpage_url ?? null })
         });
         const ext = container === "mp4" ? "mp4" : "ts";
         const blobUrl = URL.createObjectURL(blob);
