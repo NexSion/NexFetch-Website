@@ -256,12 +256,20 @@ async function handlePlaybackProxy(request) {
 // their bytes into the returned stream strictly in order — so a later
 // segment finishing before an earlier one never gets emitted out of
 // sequence, while still overlapping network latency across segments.
-function createOrderedStream(items, fetchOne) {
+//
+// `footerBytes`, if given, is enqueued once every item has been
+// emitted, right before the stream closes — used by /fetch-batch (see
+// below) as an end-to-end completeness marker. It is NEVER passed for
+// /download or /download-range, since those responses are the actual
+// video bytes handed straight to the user/extension and must not be
+// tampered with.
+function createOrderedStream(items, fetchOne, footerBytes) {
   const concurrency = 6;
   let nextToEmit = 0;
   let nextToStart = 0;
   let cancelled = false;
   let failed = null;
+  let footerSent = false;
   const inFlight = new Map();
   const completed = new Map();
 
@@ -296,6 +304,10 @@ function createOrderedStream(items, fetchOne) {
         return;
       }
       if (nextToEmit >= items.length) {
+        if (footerBytes && !footerSent) {
+          footerSent = true;
+          controller.enqueue(footerBytes);
+        }
         controller.close();
         return;
       }
@@ -529,7 +541,22 @@ async function handleDownloadRange(request) {
 // URLs to fetch and decrypt — no parsing here at all.
 //
 // POST /fetch-batch  { items: [{ uri, sequence, key: {method,keyUri,ivHex}|null }], ref }
-// Response: raw concatenated (decrypted) bytes for that batch, in order.
+// Response: raw concatenated (decrypted) bytes for that batch, in
+// order, followed by a 4-byte end marker (BATCH_END_MARKER below).
+//
+// The marker exists because a Worker invocation that gets killed mid-
+// stream (CPU-time limit, subrequest cap, transient upstream failure
+// on a later segment) can otherwise look like a perfectly valid,
+// shorter HTTP response to the client — `res.ok` is true and
+// `res.arrayBuffer()` resolves fine, it's just missing the tail end of
+// the batch. That silent truncation is what used to produce a video
+// with a clean-looking but missing chunk in the middle, with the
+// progress bar still counting the whole batch as done. The client
+// (lib/chunkedDownload.ts) now checks the buffer ends with this exact
+// marker before trusting it, strips it, and otherwise retries the
+// whole batch — so a truncated batch either self-heals via retry or
+// surfaces as a visible download error, never a silent gap.
+const BATCH_END_MARKER = new TextEncoder().encode("NXOK");
 
 async function handleFetchBatch(request) {
   if (request.method !== "POST") return json({ error: "METHOD_NOT_ALLOWED" }, 405);
@@ -574,10 +601,15 @@ async function handleFetchBatch(request) {
     return crypto.subtle.decrypt({ name: "AES-CBC", iv }, aesKey, buf);
   }
 
-  const stream = createOrderedStream(items, fetchItem);
+  const stream = createOrderedStream(items, fetchItem, BATCH_END_MARKER);
 
   return new Response(stream, {
-    headers: { "Content-Type": "application/octet-stream", "Cache-Control": "no-store", ...CORS_HEADERS }
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Cache-Control": "no-store",
+      "X-Batch-Segment-Count": String(items.length),
+      ...CORS_HEADERS
+    }
   });
 }
 

@@ -35,10 +35,31 @@ import {
 // Each batch fetch retries a few times before giving up — a single
 // transient failure (network blip, a momentarily-flaky segment on the
 // source CDN) shouldn't have to fail the whole download.
+//
+// Batch integrity: a Worker invocation that gets killed mid-stream
+// (CPU-time limit, subrequest cap, a late segment 403ing) used to look
+// like a perfectly valid, just-shorter HTTP response — `res.ok` true,
+// `res.arrayBuffer()` resolves fine — so a truncated batch was silently
+// accepted, written to the file as-is, and counted as fully "done" in
+// the progress bar. That's what produced a completed download with an
+// invisible missing chunk in the middle. The server (see
+// cloudflare-worker/stream-proxy.js's handleFetchBatch) now appends a
+// 4-byte end marker (BATCH_END_MARKER) only once every segment in the
+// batch has actually streamed through. This client checks for that
+// marker before accepting a batch as good; a mismatch is treated as a
+// failed batch and retried like any other network error, so a
+// truncated batch either self-heals or surfaces as a visible error —
+// never a silent gap. Smaller batches (24 segments instead of 40) also
+// make this failure mode itself far less likely in the first place,
+// and make the progress bar advance in smaller, smoother steps instead
+// of big jumps when several retried batches land at once.
 
-const BATCH_SEGMENTS = 40;
-const MAX_ATTEMPTS = 4;
+const BATCH_SEGMENTS = 24;
+const MAX_ATTEMPTS = 6;
 const RETRY_DELAY_MS = 1200;
+
+// Must match BATCH_END_MARKER in cloudflare-worker/stream-proxy.js.
+const BATCH_END_MARKER = new TextEncoder().encode("NXOK");
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -65,6 +86,21 @@ async function fetchTextWithRetry(url: string): Promise<string> {
   throw lastErr instanceof Error ? lastErr : new Error("PLAYLIST_FETCH_FAILED");
 }
 
+// Verifies the batch response ends with BATCH_END_MARKER (proof the
+// Worker actually finished streaming every segment in the batch, not
+// just some of them) and strips it off. Returns null if the marker is
+// missing/mismatched — the caller treats that exactly like a failed
+// fetch and retries the whole batch.
+function stripBatchMarker(buf: ArrayBuffer): ArrayBuffer | null {
+  const markerLen = BATCH_END_MARKER.length;
+  if (buf.byteLength < markerLen) return null;
+  const tail = new Uint8Array(buf, buf.byteLength - markerLen, markerLen);
+  for (let i = 0; i < markerLen; i++) {
+    if (tail[i] !== BATCH_END_MARKER[i]) return null;
+  }
+  return buf.slice(0, buf.byteLength - markerLen);
+}
+
 async function fetchBatchWithRetry(
   endpoint: string,
   items: BatchItem[],
@@ -78,8 +114,17 @@ async function fetchBatchWithRetry(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ items, ref })
       });
-      if (res.ok) return await res.arrayBuffer();
-      lastErr = new Error(`BATCH_FETCH_FAILED_${res.status}`);
+      if (res.ok) {
+        const raw = await res.arrayBuffer();
+        const verified = stripBatchMarker(raw);
+        if (verified) return verified;
+        // Response completed HTTP-wise but is missing (or has a
+        // corrupted) end marker — the Worker invocation was cut off
+        // mid-batch. Treat exactly like a fetch failure and retry.
+        lastErr = new Error("BATCH_TRUNCATED");
+      } else {
+        lastErr = new Error(`BATCH_FETCH_FAILED_${res.status}`);
+      }
     } catch (err) {
       lastErr = err;
     }
