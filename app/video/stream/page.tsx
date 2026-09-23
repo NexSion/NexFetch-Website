@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { decodeDataParam } from "@/lib/dataParam";
-import { ExtensionBridge } from "@/lib/bridge";
 import { downloadHls } from "@/lib/hlsDownload";
 import { refererFor } from "@/lib/streamProxy";
 import { formatBytes, formatDuration } from "@/lib/format";
@@ -230,36 +229,24 @@ export default function StreamPage() {
         const ext = container === "mp4" ? "mp4" : "ts";
         const blobUrl = URL.createObjectURL(blob);
         const fullName = `${finalName}.${ext}`;
-
-        // Extension isn't required — if one happens to be on this tab
-        // we let it save via chrome.downloads (skips the browser's own
-        // save dialog); otherwise a plain <a download> works exactly
-        // the same from the user's point of view.
-        const bridge = tabId ? new ExtensionBridge(tabId) : null;
-        if (bridge?.available) {
-          const result = await bridge.sendHlsBlob(blobUrl, fullName);
-          bridge.close();
-          if (!result.success) throw new Error(result.reason ?? "EXTENSION_SAVE_FAILED");
-        } else {
-          const a = document.createElement("a");
-          a.href = blobUrl;
-          a.download = fullName;
-          a.click();
-        }
+        // Plain browser download — no extension hand-off. ExtensionBridge's
+        // `available` only reflects that a BroadcastChannel object could be
+        // constructed, which succeeds with or without a real extension
+        // listening, so gating on it caused an 8s BRIDGE_TIMEOUT wait and
+        // failure whenever no extension was actually present. A plain
+        // <a download> works unconditionally.
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = fullName;
+        a.click();
       } else {
         const fullName = `${finalName}.mp4`;
         const { resolvePlayableUrl } = await import("@/lib/streamProxy");
         const fileUrl = await resolvePlayableUrl(payload);
-        const bridge = tabId ? new ExtensionBridge(tabId) : null;
-        if (bridge?.available) {
-          await bridge.startDownload(fileUrl, fullName);
-          bridge.close();
-        } else {
-          const a = document.createElement("a");
-          a.href = fileUrl;
-          a.download = fullName;
-          a.click();
-        }
+        const a = document.createElement("a");
+        a.href = fileUrl;
+        a.download = fullName;
+        a.click();
       }
       setDownloadState("done");
     } catch (err) {

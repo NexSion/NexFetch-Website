@@ -234,35 +234,22 @@ export default function StreamPage() {
         const ext = container === "mp4" ? "mp4" : "ts";
         const blobUrl = URL.createObjectURL(blob);
         const fullName = `${finalName}.${ext}`;
-
-        const bridge = tabId ? new ExtensionBridge(tabId) : null;
-        if (bridge?.available) {
-          const result = await bridge.sendHlsBlob(blobUrl, fullName);
-          bridge.close();
-          if (!result.success) throw new Error(result.reason ?? "EXTENSION_SAVE_FAILED");
-        } else {
-          // No extension on this browser — a plain blob download still
-          // works natively, no extension required for this part.
-          const a = document.createElement("a");
-          a.href = blobUrl;
-          a.download = fullName;
-          a.click();
-        }
+        // Plain download, no extension hand-off — see the note in
+        // app/video/stream/page.tsx: ExtensionBridge.available doesn't
+        // actually confirm an extension is listening, so gating on it
+        // caused an 8s BRIDGE_TIMEOUT failure with no real extension.
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = fullName;
+        a.click();
         setDownloadState("done");
       } else {
         const ext = videoData.extension || "mp4";
         const fullName = `${finalName}.${ext}`;
-        const bridge = tabId ? new ExtensionBridge(tabId) : null;
-
-        if (bridge?.available) {
-          await bridge.startDownload(videoData.url, fullName);
-          bridge.close();
-        } else {
-          const a = document.createElement("a");
-          a.href = videoData.url;
-          a.download = fullName;
-          a.click();
-        }
+        const a = document.createElement("a");
+        a.href = videoData.url;
+        a.download = fullName;
+        a.click();
         setDownloadState("done");
       }
     } catch (err) {
