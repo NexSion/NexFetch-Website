@@ -3,14 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { decodeDataParam } from "@/lib/dataParam";
-import { formatDuration } from "@/lib/format";
 import GlassCard from "@/components/GlassCard";
 
-// Route: /video/cast?data=<base64>&tid=<tabId>&dkey=<deviceKey>
-// Confirmed from popup.js's ko(): note the field is `thumb`, not
-// `thumbnail` (different from the /video/stream payload — the
-// extension's own naming is inconsistent between the two, not a typo
-// on this site's part).
 interface CastPayload {
   url: string;
   audio_url?: string | null;
@@ -22,6 +16,8 @@ interface CastPayload {
   stream_type?: "dash";
 }
 
+type LimitState = "checking" | "allowed" | "blocked" | "login_required";
+
 function isM3u8(url: string) {
   return url.includes(".m3u8");
 }
@@ -29,12 +25,11 @@ function isM3u8(url: string) {
 export default function CastPage() {
   const search = useSearchParams();
   const payload = useMemo(() => decodeDataParam<CastPayload>(search.get("data")), [search]);
-  const dkey = search.get("dkey");
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<import("hls.js").default | null>(null);
 
-  const [limitState, setLimitState] = useState<"checking" | "allowed" | "blocked">("checking");
+  const [limitState, setLimitState] = useState<LimitState>("checking");
   const [limitMessage, setLimitMessage] = useState("");
   const [playerError, setPlayerError] = useState("");
 
@@ -43,10 +38,14 @@ export default function CastPage() {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ device_key: dkey ?? crypto.randomUUID() })
+      body: JSON.stringify({})
     })
-      .then((r) => r.json())
-      .then((json) => {
+      .then(async (r) => {
+        if (r.status === 401) {
+          setLimitState("login_required");
+          return;
+        }
+        const json = await r.json();
         if (json.success && json.data?.allowed === false) {
           setLimitState("blocked");
           setLimitMessage(`Daily cast limit reached (${json.data.limit}/day on the free plan).`);
@@ -55,7 +54,7 @@ export default function CastPage() {
         }
       })
       .catch(() => setLimitState("allowed"));
-  }, [dkey]);
+  }, []);
 
   useEffect(() => {
     if (limitState !== "allowed" || !payload || !videoRef.current) return;
@@ -121,6 +120,22 @@ export default function CastPage() {
 
   if (limitState === "checking") {
     return <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">Checking your daily cast limit…</div>;
+  }
+
+  if (limitState === "login_required") {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-16 text-center">
+        <GlassCard className="glow-border">
+          <p className="text-white">Log in to cast this video.</p>
+          <a
+            href="/login"
+            className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white"
+          >
+            Log in with Google
+          </a>
+        </GlassCard>
+      </div>
+    );
   }
 
   if (limitState === "blocked") {

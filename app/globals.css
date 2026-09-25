@@ -18,6 +18,7 @@ body {
     radial-gradient(circle at 50% 100%, rgba(29, 78, 216, 0.10), transparent 50%);
   background-attachment: fixed;
   color: #e6e9f5;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 .glass {
@@ -34,6 +35,56 @@ body {
 
 ::selection {
   background: rgba(139, 92, 246, 0.35);
+}
+
+/* ---------------------------------------------------------------
+   Light theme (toggled via ThemeToggle adding .light to <html>).
+   Every text-white/NN utility used across the site is listed here —
+   without this, "Create an account" (and anything else styled
+   text-white/85 etc.) renders near-white on a near-white page and is
+   effectively invisible, which was the reported bug.
+   --------------------------------------------------------------- */
+html.light {
+  color-scheme: light;
+}
+
+html.light body {
+  background-color: #f4f6fb;
+  background-image: radial-gradient(circle at 15% 10%, rgba(59, 130, 246, 0.08), transparent 40%),
+    radial-gradient(circle at 85% 0%, rgba(139, 92, 246, 0.07), transparent 45%);
+  color: #10131c;
+}
+
+html.light .glass {
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+html.light .text-white,
+html.light .text-white\/85,
+html.light .text-white\/90 {
+  color: #10131c;
+}
+
+html.light .text-white\/70,
+html.light .text-white\/60,
+html.light .text-white\/55,
+html.light .text-white\/50,
+html.light .text-white\/45,
+html.light .text-white\/40 {
+  color: rgba(16, 19, 28, 0.62);
+}
+
+html.light .border-white\/10,
+html.light .border-white\/12,
+html.light .border-white\/15 {
+  border-color: rgba(15, 23, 42, 0.14);
+}
+
+html.light .bg-black\/30,
+html.light .bg-black\/40,
+html.light .bg-black\/60 {
+  background-color: rgba(15, 23, 42, 0.06);
 }
 
 @media (prefers-reduced-motion: reduce) {

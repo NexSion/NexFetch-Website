@@ -10,28 +10,12 @@ import GlassCard from "@/components/GlassCard";
 
 // Route: /video/stream?data=<base64>&tid=<tabId>&id=<uuid>&dkey=<deviceKey>
 //
-// Confirmed directly from popup.js's hn()/mn()/ue(): the extension
-// does NOT ask this page to look a video up by id — it base64-encodes
-// the whole payload into `data` up front. `id` and `dkey` ride along
-// only so this page can talk back to the extension (via the
-// BroadcastChannel bridge) for the actual download/blob-save step —
-// and even that is optional: if no extension is present on this tab,
-// downloads still work as a plain browser download, no extension
-// required.
-//
-// Download strategy (website-only, no extension dependency): every
-// HLS download goes through lib/hlsDownload.ts's downloadHls(), which
-// parses the playlist and decrypts AES-128 segments entirely in the
-// browser, routing individual fetches through the Cloudflare Worker's
-// lean relay (cloudflare-worker/stream-proxy.js, mode 1) only for
-// hosts that actually reject a direct browser fetch (Referer/hotlink
-// protection — confirmed against a real Bunny Stream 403 via
-// devtools). The Worker never does the AES decryption itself anymore
-// (that used to happen in a separate /fetch-batch batch-decrypt mode,
-// removed from this flow — see lib/chunkedDownload.ts's file header
-// for why: Cloudflare Workers' free-plan CPU-time cap could silently
-// truncate a batch mid-decrypt). Decryption has no such limit in the
-// browser, so this is both simpler and more reliable.
+// Login is required to reach this page's content at all (see
+// middleware.ts) — the old anonymous/device-only free tier is
+// retired. `id`/`dkey` still ride along for the BroadcastChannel
+// bridge and the device-claim flow, `tid` is unused now that
+// downloads no longer go through the extension bridge (see
+// lib/hlsDownload.ts's file header for why).
 interface StreamPayload {
   url: string;
   source_url?: string | null;
@@ -44,6 +28,7 @@ interface StreamPayload {
   stream_type?: "dash";
 }
 
+type LimitState = "checking" | "allowed" | "blocked" | "login_required";
 type DownloadState = "idle" | "downloading" | "done" | "error";
 
 const AUTOSTART_KEY = "nexfetch:autostart";
@@ -56,14 +41,13 @@ function isM3u8(url: string) {
 export default function StreamPage() {
   const search = useSearchParams();
   const payload = useMemo(() => decodeDataParam<StreamPayload>(search.get("data")), [search]);
-  const tabId = search.get("tid");
   const uuid = search.get("id");
   const dkey = search.get("dkey");
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<import("hls.js").default | null>(null);
 
-  const [limitState, setLimitState] = useState<"checking" | "allowed" | "blocked">("checking");
+  const [limitState, setLimitState] = useState<LimitState>("checking");
   const [limitMessage, setLimitMessage] = useState("");
   const [playerError, setPlayerError] = useState("");
   const [isPlaying, setIsPlaying] = useState(false);
@@ -94,31 +78,29 @@ export default function StreamPage() {
     });
   }
 
-  // Daily stream limit — dkey may be absent (e.g. a plain shared link);
-  // the route treats a missing device_key as an anonymous/free check.
+  // ---- daily 10GB free-plan data cap (login required) ----
   useEffect(() => {
     fetch("/api/streaming/check-limit", {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ device_key: dkey ?? crypto.randomUUID() })
+      body: JSON.stringify({ device_key: dkey ?? undefined })
     })
-      .then((r) => r.json())
-      .then((json) => {
+      .then(async (r) => {
+        if (r.status === 401) {
+          setLimitState("login_required");
+          return;
+        }
+        const json = await r.json();
         if (json.success && json.data?.allowed === false) {
           setLimitState("blocked");
-          setLimitMessage(`Daily stream limit reached (${json.data.limit}/day on the free plan).`);
+          setLimitMessage(`Daily free-plan limit reached (${formatBytes(json.data.limit)} used today).`);
         } else {
           setLimitState("allowed");
         }
       })
       .catch(() => setLimitState("allowed"));
   }, [dkey]);
-
-  useEffect(() => {
-    if (autoSave || !payload || autoSaved) return;
-    // gated by the checkbox below, this effect just reacts to it
-  }, [autoSave, payload, autoSaved]);
 
   useEffect(() => {
     if (!autoSave || autoSaved || !payload) return;
@@ -142,9 +124,6 @@ export default function StreamPage() {
     setIsPlaying(true);
   }
 
-  // Runs once the <video> element actually exists in the DOM (i.e.
-  // after isPlaying flips true and React re-renders) — attaching hls.js
-  // or setting .src before that point silently no-ops against a null ref.
   useEffect(() => {
     if (!isPlaying || !payload || !videoRef.current) return;
     const video = videoRef.current;
@@ -209,6 +188,11 @@ export default function StreamPage() {
     if (videoRef.current) videoRef.current.playbackRate = speed;
   }, [speed]);
 
+  // ---- download ----
+  // Fully browser-side (see lib/hlsDownload.ts) — no extension needed.
+  // After the blob is built, its size is reported to
+  // /api/streaming/report-bytes so tomorrow's check-limit call reflects
+  // today's usage against the 10GB free-plan cap.
   async function handleDownload() {
     if (!payload) return;
     setDownloadState("downloading");
@@ -226,15 +210,17 @@ export default function StreamPage() {
           onProgress: setDownloadProgress,
           refererUrl: refererFor(payload)
         });
+
+        fetch("/api/streaming/report-bytes", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bytes: blob.size })
+        }).catch(() => {});
+
         const ext = container === "mp4" ? "mp4" : "ts";
         const blobUrl = URL.createObjectURL(blob);
         const fullName = `${finalName}.${ext}`;
-        // Plain browser download — no extension hand-off. ExtensionBridge's
-        // `available` only reflects that a BroadcastChannel object could be
-        // constructed, which succeeds with or without a real extension
-        // listening, so gating on it caused an 8s BRIDGE_TIMEOUT wait and
-        // failure whenever no extension was actually present. A plain
-        // <a download> works unconditionally.
         const a = document.createElement("a");
         a.href = blobUrl;
         a.download = fullName;
@@ -268,11 +254,9 @@ export default function StreamPage() {
                 ? `Download failed — the source returned HTTP ${fetchStatus[2]} while fetching ${
                     fetchStatus[1] === "PLAYLIST_FETCH_FAILED" ? "the playlist" : "a video segment"
                   }. The link may have expired — try reopening this from the extension.`
-                : msg === "EXTENSION_SAVE_FAILED"
-                  ? "The extension couldn't save the file. Try again or check its permissions."
-                  : `Download failed — the source may block cross-origin access from this page.${
-                      msg ? ` (${msg})` : ""
-                    }`
+                : `Download failed — the source may block cross-origin access from this page.${
+                    msg ? ` (${msg})` : ""
+                  }`
       );
     }
   }
@@ -283,19 +267,37 @@ export default function StreamPage() {
       formatDuration(payload.duration ? Number(payload.duration) : undefined),
       payload.quality,
       formatBytes(payload.size ? Number(payload.size) : undefined),
-      (payload.stream_type === "dash" ? "DASH" : isM3u8(payload.url) ? "HLS" : null),
-      payload.source_url ? (() => {
-        try {
-          return new URL(payload.source_url!).hostname;
-        } catch {
-          return null;
-        }
-      })() : null
+      payload.stream_type === "dash" ? "DASH" : isM3u8(payload.url) ? "HLS" : null,
+      payload.source_url
+        ? (() => {
+            try {
+              return new URL(payload.source_url!).hostname;
+            } catch {
+              return null;
+            }
+          })()
+        : null
     ].filter(Boolean) as string[];
   }, [payload]);
 
   if (limitState === "checking") {
-    return <div className="mx-auto max-w-4xl px-6 py-16 text-center text-white/60">Checking your daily stream limit…</div>;
+    return <div className="mx-auto max-w-4xl px-6 py-16 text-center text-white/60">Checking your daily limit…</div>;
+  }
+
+  if (limitState === "login_required") {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-16 text-center">
+        <GlassCard className="glow-border">
+          <p className="text-white">Log in to stream or download this video.</p>
+          <a
+            href={`/login${dkey ? `?dkey=${encodeURIComponent(dkey)}` : ""}`}
+            className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white"
+          >
+            Log in with Google
+          </a>
+        </GlassCard>
+      </div>
+    );
   }
 
   if (limitState === "blocked") {
@@ -303,9 +305,7 @@ export default function StreamPage() {
       <div className="mx-auto max-w-2xl px-6 py-16 text-center">
         <GlassCard className="glow-border">
           <p className="text-white">{limitMessage}</p>
-          <a href="/pricing" className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white">
-            View upgrade options
-          </a>
+          <p className="mt-3 text-sm text-white/50">Resets at midnight UTC, or upgrade to Premium for no cap.</p>
         </GlassCard>
       </div>
     );

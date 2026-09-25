@@ -6,13 +6,7 @@ import { ExtensionBridge, type VideoLinkData } from "@/lib/bridge";
 import { formatBytes, formatDuration } from "@/lib/format";
 import GlassCard from "@/components/GlassCard";
 
-// Route: /video/cast/[id] — the cast SOURCE page. The Chromecast
-// session itself is started from the extension popup via the Cast
-// SDK; this page's job is enforcing the daily cast quota and giving
-// the receiver a URL that actually plays (same HLS-in-browser fix as
-// the stream page — a raw .m3u8 src fails silently in a plain <video>
-// tag in Chrome).
-type LimitState = "checking" | "allowed" | "blocked";
+type LimitState = "checking" | "allowed" | "blocked" | "login_required";
 type ResolveState = "resolving" | "ready" | "error";
 
 function isHlsLike(data: VideoLinkData | null): boolean {
@@ -50,11 +44,15 @@ export default function CastPage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({})
     })
-      .then((r) => r.json())
-      .then((json) => {
-        if (json.success && json.allowed === false) {
+      .then(async (r) => {
+        if (r.status === 401) {
+          setLimitState("login_required");
+          return;
+        }
+        const json = await r.json();
+        if (json.success && json.data?.allowed === false) {
           setLimitState("blocked");
-          setLimitMessage(`Daily cast limit reached (${json.limit}/day on the free plan).`);
+          setLimitMessage(`Daily cast limit reached (${json.data.limit}/day on the free plan).`);
         } else {
           setLimitState("allowed");
         }
@@ -93,7 +91,7 @@ export default function CastPage() {
   }, [tabId, params.id]);
 
   useEffect(() => {
-    if (resolveState !== "ready" || !videoData || !videoRef.current) return;
+    if (resolveState !== "ready" || limitState !== "allowed" || !videoData || !videoRef.current) return;
     const video = videoRef.current;
 
     (async () => {
@@ -126,7 +124,7 @@ export default function CastPage() {
       hlsRef.current?.destroy();
       hlsRef.current = null;
     };
-  }, [resolveState, videoData]);
+  }, [resolveState, limitState, videoData]);
 
   const chips = useMemo(() => {
     if (!videoData) return [];
@@ -142,6 +140,22 @@ export default function CastPage() {
     return (
       <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">
         {limitState === "checking" ? "Checking your daily cast limit…" : "Loading…"}
+      </div>
+    );
+  }
+
+  if (limitState === "login_required") {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-16 text-center">
+        <GlassCard className="glow-border">
+          <p className="text-white">Log in to cast this video.</p>
+          <a
+            href="/login"
+            className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white"
+          >
+            Log in with Google
+          </a>
+        </GlassCard>
       </div>
     );
   }

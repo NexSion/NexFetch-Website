@@ -8,7 +8,7 @@ import { refererFor } from "@/lib/streamProxy";
 import { formatBytes, formatDuration } from "@/lib/format";
 import GlassCard from "@/components/GlassCard";
 
-type LimitState = "checking" | "allowed" | "blocked";
+type LimitState = "checking" | "allowed" | "blocked" | "login_required";
 type ResolveState = "resolving" | "ready" | "error";
 type DownloadState = "idle" | "downloading" | "done" | "error";
 
@@ -25,8 +25,7 @@ export default function StreamPage() {
   const params = useParams<{ id: string }>();
   const search = useSearchParams();
   const tabId = search.get("tid");
-  // Fallback fields let this page also work from a plain link (no
-  // extension tab context) for quick testing: /video/stream/x?url=...
+  const dkey = search.get("dkey");
   const fallback: VideoLinkData | null = search.get("url")
     ? {
         url: search.get("url")!,
@@ -58,7 +57,6 @@ export default function StreamPage() {
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState("");
 
-  // ---- restore per-viewer prefs ----
   useEffect(() => {
     setAutoStart(localStorage.getItem(AUTOSTART_KEY) === "1");
     setAutoSave(localStorage.getItem(AUTOSAVE_KEY) === "1");
@@ -77,27 +75,30 @@ export default function StreamPage() {
     });
   }
 
-  // ---- daily stream limit ----
+  // ---- daily 10GB free-plan data cap (login required) ----
   useEffect(() => {
     fetch("/api/streaming/check-limit", {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({})
+      body: JSON.stringify({ device_key: dkey ?? undefined })
     })
-      .then((r) => r.json())
-      .then((json) => {
-        if (json.success && json.allowed === false) {
+      .then(async (r) => {
+        if (r.status === 401) {
+          setLimitState("login_required");
+          return;
+        }
+        const json = await r.json();
+        if (json.success && json.data?.allowed === false) {
           setLimitState("blocked");
-          setLimitMessage(`Daily stream limit reached (${json.limit}/day on the free plan).`);
+          setLimitMessage(`Daily free-plan limit reached (${formatBytes(json.data.limit)} used today).`);
         } else {
           setLimitState("allowed");
         }
       })
-      .catch(() => setLimitState("allowed")); // fail open
-  }, []);
+      .catch(() => setLimitState("allowed"));
+  }, [dkey]);
 
-  // ---- resolve video data via the extension bridge ----
   useEffect(() => {
     if (videoData) {
       setResolveState("ready");
@@ -132,12 +133,10 @@ export default function StreamPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId, params.id]);
 
-  // ---- filename default ----
   useEffect(() => {
     if (videoData?.title && !filename) setFilename(videoData.title);
   }, [videoData, filename]);
 
-  // ---- auto-save to library once resolved ----
   useEffect(() => {
     if (!autoSave || autoSaved || !videoData || resolveState !== "ready") return;
     const hash = videoData.uuid ?? videoData.url;
@@ -151,7 +150,6 @@ export default function StreamPage() {
       .catch(() => {});
   }, [autoSave, autoSaved, videoData, resolveState]);
 
-  // ---- attach player (hls.js for m3u8/mpd, native src otherwise) ----
   async function startPlayback() {
     if (!videoData || !videoRef.current) return;
     setIsPlaying(true);
@@ -178,7 +176,6 @@ export default function StreamPage() {
         hls.attachMedia(video);
         hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
       } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-        // Safari plays HLS natively.
         video.src = videoData.url;
         video.play().catch(() => {});
       } else {
@@ -192,29 +189,21 @@ export default function StreamPage() {
   }
 
   useEffect(() => {
-    if (autoStart && resolveState === "ready" && !isPlaying) startPlayback();
+    if (autoStart && limitState === "allowed" && resolveState === "ready" && !isPlaying) startPlayback();
     return () => {
       hlsRef.current?.destroy();
       hlsRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStart, resolveState]);
+  }, [autoStart, limitState, resolveState]);
 
   useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = speed;
   }, [speed]);
 
-  // ---- download ----
-  // Downloads never require the extension: downloadHls() (see
-  // lib/hlsDownload.ts) does everything in the browser — playlist
-  // parse, per-segment fetch (proxied through the Cloudflare Worker's
-  // lean relay only for hosts that reject a direct fetch, e.g. Bunny
-  // Stream Referer allow-lists), and AES-128 decrypt via Web Crypto.
-  // If an extension happens to be on this tab we still hand the
-  // finished blob to it so it can save via chrome.downloads (skips
-  // the browser's own save dialog) — but that's an optional nicety,
-  // not a requirement; the plain <a download> fallback below works
-  // identically without one.
+  // ---- download: fully browser-side (see lib/hlsDownload.ts), no
+  // extension required. Bytes are reported after the blob is built so
+  // the 10GB/day free-plan cap tracks actual usage. ----
   async function handleDownload() {
     if (!videoData) return;
     setDownloadState("downloading");
@@ -231,13 +220,17 @@ export default function StreamPage() {
           onProgress: setDownloadProgress,
           refererUrl: refererFor({ url: videoData.url, source_url: videoData.webpage_url ?? null })
         });
+
+        fetch("/api/streaming/report-bytes", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ bytes: blob.size })
+        }).catch(() => {});
+
         const ext = container === "mp4" ? "mp4" : "ts";
         const blobUrl = URL.createObjectURL(blob);
         const fullName = `${finalName}.${ext}`;
-        // Plain download, no extension hand-off — see the note in
-        // app/video/stream/page.tsx: ExtensionBridge.available doesn't
-        // actually confirm an extension is listening, so gating on it
-        // caused an 8s BRIDGE_TIMEOUT failure with no real extension.
         const a = document.createElement("a");
         a.href = blobUrl;
         a.download = fullName;
@@ -276,7 +269,23 @@ export default function StreamPage() {
   if (limitState === "checking" || resolveState === "resolving") {
     return (
       <div className="mx-auto max-w-4xl px-6 py-16 text-center text-white/60">
-        {limitState === "checking" ? "Checking your daily stream limit…" : "Loading video…"}
+        {limitState === "checking" ? "Checking your daily limit…" : "Loading video…"}
+      </div>
+    );
+  }
+
+  if (limitState === "login_required") {
+    return (
+      <div className="mx-auto max-w-2xl px-6 py-16 text-center">
+        <GlassCard className="glow-border">
+          <p className="text-white">Log in to stream or download this video.</p>
+          <a
+            href="/login"
+            className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white"
+          >
+            Log in with Google
+          </a>
+        </GlassCard>
       </div>
     );
   }
@@ -286,18 +295,14 @@ export default function StreamPage() {
       <div className="mx-auto max-w-2xl px-6 py-16 text-center">
         <GlassCard className="glow-border">
           <p className="text-white">{limitMessage}</p>
-          <a href="/pricing" className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white">
-            View upgrade options
-          </a>
+          <p className="mt-3 text-sm text-white/50">Resets at midnight UTC, or upgrade to Premium for no cap.</p>
         </GlassCard>
       </div>
     );
   }
 
   if (resolveState === "error" || !videoData) {
-    return (
-      <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">{resolveError}</div>
-    );
+    return <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">{resolveError}</div>;
   }
 
   return (
@@ -409,8 +414,7 @@ export default function StreamPage() {
 
         {!bridgeAvailable && tabId && (
           <p className="mt-3 text-xs text-white/40">
-            NexFetch extension not detected — downloads will use your browser&apos;s normal save dialog instead of a
-            silent save.
+            NexFetch extension not detected — playback data came from the URL fallback instead.
           </p>
         )}
       </GlassCard>

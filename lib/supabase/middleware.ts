@@ -2,8 +2,10 @@ import { createServerClient, type CookieOptions } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
 /**
- * Refreshes the Supabase session cookie on every request so it never
- * silently expires under the extension's long-lived background checks.
+ * Refreshes the Supabase session cookie on every request and returns
+ * the resolved user alongside the response, so the caller (middleware)
+ * can redirect unauthenticated visitors away from account-only pages
+ * without a second round-trip.
  */
 export async function updateSession(request: NextRequest) {
   let response = NextResponse.next({ request: { headers: request.headers } });
@@ -30,6 +32,9 @@ export async function updateSession(request: NextRequest) {
     }
   );
 
-  await supabase.auth.getUser();
-  return response;
+  const {
+    data: { user }
+  } = await supabase.auth.getUser();
+
+  return { response, user };
 }
