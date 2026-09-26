@@ -2,56 +2,35 @@
 
 // A from-scratch, dependency-free HLS downloader: parses master/media
 // m3u8 playlists, fetches every segment, and concatenates them into a
-// single Blob the extension can hand to chrome.downloads (via
-// bridge.sendHlsBlob — see downloads:hls-blob in service_worker.js),
-// or that this page can trigger as a plain <a download> when no
-// extension is present.
-//
-// AES-128 (the standard, non-DRM HLS content-key scheme used by most
-// CDNs, including Bunny Stream) is decrypted client-side via
-// SubtleCrypto — the key is fetched over HTTP and used with AES-CBC,
-// exactly like hls.js does for in-browser playback.
+// single Blob. AES-128 is decrypted client-side via SubtleCrypto.
 //
 // Proxy-aware fetching: some sources (Bunny Stream pull zones with
-// Referer allow-lists, confirmed via devtools against a real 403 on
-// this exact CDN — see the comments in cloudflare-worker/stream-
-// proxy.js's handlePlaybackProxy) reject a direct browser fetch
-// outright. When that happens for a given host, every subsequent
-// fetch to that same host (playlist, key, every segment) is routed
-// through the Worker's lean relay endpoint instead (mode 1 in
-// stream-proxy.js — a plain fetch-and-stream-back with a spoofed
-// Referer, no decryption happening server-side). The decision is
-// probed once per host and cached for the rest of this download, so
-// we don't re-probe hundreds of segment URLs individually.
+// Referer allow-lists, etc.) reject a direct browser fetch outright.
+// When that happens for a given host, every subsequent fetch to that
+// host is routed through the Worker's lean relay endpoint instead
+// (see cloudflare-worker/stream-proxy.js's handlePlaybackProxy) — the
+// Worker never decrypts, only relays bytes, so it stays CPU-cheap
+// regardless of segment size. Decryption always happens here in the
+// browser, which has no CPU-time limit.
 //
-// Deliberately NOT decrypting on the Worker (unlike the old
-// /fetch-batch approach in lib/chunkedDownload.ts): Cloudflare
-// Workers' free plan caps CPU time at ~10ms per invocation, and
-// AES-CBC-decrypting a batch of segments in one invocation could
-// exceed that and silently truncate the response mid-stream. A pure
-// relay (no decrypt) is CPU-trivial regardless of segment size, so
-// that failure mode doesn't apply here — decryption happens in the
-// browser instead, which has no such limit.
+// Pause/resume/cancel: callers pass a DownloadController and can call
+// .pause()/.resume()/.cancel() on it from the UI while a download is
+// in flight — segment workers check it between fetches. Progress is
+// reported as {fraction, completed, total, bytesLoaded} so the UI can
+// show "12/340 segments · 84 MB" style detail, matching what a normal
+// download manager shows.
 //
 // Honest limitations, on purpose rather than by accident:
-//  - SAMPLE-AES / SAMPLE-AES-CTR / SAMPLE-AES-CENC (real DRM schemes —
-//    Widevine, FairPlay, PlayReady) throw ENCRYPTED_STREAM_UNSUPPORTED.
-//    These encrypt individual media samples inside the container and
-//    require a licensed key exchange; there's no client-side bypass.
-//  - This concatenates segments; it does not remux to a strictly
-//    spec-clean container the way ffmpeg would. For fMP4/CMAF HLS
-//    (an EXT-X-MAP init segment present) the result is a genuinely
-//    valid fragmented MP4. For legacy .ts-segmented HLS, the result is
-//    a valid MPEG-TS file — it plays in VLC/mpv and most players, but
-//    isn't repackaged into an .mp4 container.
-//  - Only the first variant in a master playlist is auto-picked unless
-//    a target height is given.
-//  - The whole file is assembled in browser memory before being
-//    handed off as a Blob — fine up to a few GB on a modern desktop
-//    browser, but very large downloads on memory-constrained devices
-//    may fail. There's no streaming-to-disk path here (that's what
-//    lib/chunkedDownload.ts's File System Access API branch was for,
-//    now unused by the main download flow after this change).
+//  - SAMPLE-AES / SAMPLE-AES-CTR / SAMPLE-AES-CENC (real DRM schemes)
+//    throw ENCRYPTED_STREAM_UNSUPPORTED — no client-side bypass exists.
+//  - This concatenates segments; for fMP4/CMAF HLS (EXT-X-MAP present)
+//    the result is a valid fragmented MP4. For legacy .ts-segmented
+//    HLS, the result is a valid MPEG-TS file — plays in VLC/mpv, not
+//    repackaged into .mp4.
+//  - Only the first/best variant in a master playlist is auto-picked
+//    unless a target height is given.
+//  - The whole file is assembled in browser memory before being handed
+//    back as a Blob — fine up to a few GB on a modern desktop browser.
 
 import { needsProxy, buildProxiedUrl } from "@/lib/streamProxy";
 
@@ -61,7 +40,38 @@ export interface HlsDownloadResult {
   segmentCount: number;
 }
 
-export type ProgressCallback = (fraction: number) => void;
+export interface DownloadProgressInfo {
+  fraction: number;
+  completed: number;
+  total: number;
+  bytesLoaded: number;
+}
+
+export type ProgressCallback = (info: DownloadProgressInfo) => void;
+
+// Passed by the caller so the UI can pause/resume/cancel an in-flight
+// download. Segment workers poll `.paused` between fetches and throw
+// DOWNLOAD_CANCELLED if `.cancelled` is set.
+export class DownloadController {
+  paused = false;
+  cancelled = false;
+  pause() {
+    this.paused = true;
+  }
+  resume() {
+    this.paused = false;
+  }
+  cancel() {
+    this.cancelled = true;
+  }
+}
+
+async function waitWhilePaused(controller?: DownloadController) {
+  while (controller?.paused && !controller.cancelled) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  if (controller?.cancelled) throw new Error("DOWNLOAD_CANCELLED");
+}
 
 export function resolveUrl(base: string, ref: string): string {
   try {
@@ -74,7 +84,7 @@ export function resolveUrl(base: string, ref: string): string {
 export interface KeyState {
   method: string;
   keyUri: string;
-  ivHex: string | null; // explicit IV attribute, if present (without 0x)
+  ivHex: string | null;
 }
 
 export interface ParsedSegment {
@@ -175,10 +185,6 @@ export function isMasterPlaylist(text: string): boolean {
   return text.includes("#EXT-X-STREAM-INF");
 }
 
-// Per-host "does this need the proxy relay" decision, probed once and
-// reused for every later fetch to the same host within this download
-// (playlist, key, and every one of possibly hundreds of segments all
-// share one decision instead of one probe each).
 const proxyDecisionCache = new Map<string, boolean>();
 
 async function resolveFetchUrl(url: string, refererUrl: string | null | undefined): Promise<string> {
@@ -196,31 +202,20 @@ async function resolveFetchUrl(url: string, refererUrl: string | null | undefine
   return goThroughProxy ? buildProxiedUrl(url, refererUrl ?? null) : url;
 }
 
-async function fetchText(
-  url: string,
-  headers?: Record<string, string>,
-  refererUrl?: string | null
-): Promise<string> {
+async function fetchText(url: string, headers?: Record<string, string>, refererUrl?: string | null): Promise<string> {
   const finalUrl = await resolveFetchUrl(url, refererUrl);
   const res = await fetch(finalUrl, { headers });
   if (!res.ok) throw new Error(`PLAYLIST_FETCH_FAILED_${res.status}`);
   return res.text();
 }
 
-async function fetchBuffer(
-  url: string,
-  headers?: Record<string, string>,
-  refererUrl?: string | null
-): Promise<ArrayBuffer> {
+async function fetchBuffer(url: string, headers?: Record<string, string>, refererUrl?: string | null): Promise<ArrayBuffer> {
   const finalUrl = await resolveFetchUrl(url, refererUrl);
   const res = await fetch(finalUrl, { headers });
   if (!res.ok) throw new Error(`SEGMENT_FETCH_FAILED_${res.status}`);
   return res.arrayBuffer();
 }
 
-// Per HLS spec (RFC 8216 §5.2): if EXT-X-KEY has no IV attribute, the
-// segment's media-sequence number is used as the IV — a 128-bit
-// big-endian integer.
 function sequenceToIv(sequence: number): Uint8Array {
   const iv = new Uint8Array(16);
   let n = sequence;
@@ -280,18 +275,25 @@ async function fetchAllSegments(
   segments: ParsedSegment[],
   headers: Record<string, string> | undefined,
   refererUrl: string | null | undefined,
+  controller: DownloadController | undefined,
   onProgress?: ProgressCallback
 ): Promise<ArrayBuffer[]> {
   const results = new Array<ArrayBuffer>(segments.length);
   let completed = 0;
+  let bytesLoaded = 0;
   let cursor = 0;
 
   async function worker() {
     while (cursor < segments.length) {
+      await waitWhilePaused(controller);
+      if (controller?.cancelled) throw new Error("DOWNLOAD_CANCELLED");
+
       const index = cursor++;
-      results[index] = await fetchAndDecryptSegment(segments[index], headers, refererUrl);
+      const buf = await fetchAndDecryptSegment(segments[index], headers, refererUrl);
+      results[index] = buf;
       completed++;
-      onProgress?.(completed / segments.length);
+      bytesLoaded += buf.byteLength;
+      onProgress?.({ fraction: completed / segments.length, completed, total: segments.length, bytesLoaded });
     }
   }
 
@@ -305,14 +307,11 @@ export async function downloadHls(
     headers?: Record<string, string>;
     targetHeight?: number;
     onProgress?: ProgressCallback;
-    // The Referer this download should present to upstream hosts that
-    // need the proxy relay — pass refererFor(payload) from
-    // lib/streamProxy.ts. Falls back to the playlist's own origin
-    // (streamProxy's own default) when omitted.
     refererUrl?: string | null;
+    controller?: DownloadController;
   } = {}
 ): Promise<HlsDownloadResult> {
-  const { headers, targetHeight, onProgress, refererUrl } = options;
+  const { headers, targetHeight, onProgress, refererUrl, controller } = options;
 
   let mediaPlaylistUrl = playlistUrl;
   const rootText = await fetchText(playlistUrl, headers, refererUrl);
@@ -333,8 +332,6 @@ export async function downloadHls(
 
   if (!segments.length) throw new Error("NO_SEGMENTS_FOUND");
 
-  // Fail fast (before spending time on segment fetches) if any segment
-  // uses a scheme we genuinely can't decrypt.
   for (const seg of segments) {
     if (seg.key && !SUPPORTED_ENCRYPTED_METHODS.has(seg.key.method)) {
       throw new Error("ENCRYPTED_STREAM_UNSUPPORTED");
@@ -342,7 +339,7 @@ export async function downloadHls(
   }
 
   const mapBuffer = mapUri ? await fetchBuffer(mapUri, headers, refererUrl) : null;
-  const segmentBuffers = await fetchAllSegments(segments, headers, refererUrl, onProgress);
+  const segmentBuffers = await fetchAllSegments(segments, headers, refererUrl, controller, onProgress);
   const buffers = mapBuffer ? [mapBuffer, ...segmentBuffers] : segmentBuffers;
 
   const container = mapUri ? "mp4" : "ts";

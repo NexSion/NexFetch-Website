@@ -3,36 +3,39 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { decodeDataParam } from "@/lib/dataParam";
-import { downloadHls } from "@/lib/hlsDownload";
+import { downloadHls, DownloadController, type DownloadProgressInfo } from "@/lib/hlsDownload";
 import { refererFor } from "@/lib/streamProxy";
 import { formatBytes, formatDuration } from "@/lib/format";
+import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import GlassCard from "@/components/GlassCard";
 
 // Route: /video/stream?data=<base64>&tid=<tabId>&id=<uuid>&dkey=<deviceKey>
 //
-// Login is required to reach this page's content at all (see
-// middleware.ts) — the old anonymous/device-only free tier is
-// retired. `id`/`dkey` still ride along for the BroadcastChannel
-// bridge and the device-claim flow, `tid` is unused now that
-// downloads no longer go through the extension bridge (see
-// lib/hlsDownload.ts's file header for why).
+// Auto-start / Auto-save are account-level preferences now (profiles.
+// auto_download / profiles.auto_save), not per-browser localStorage —
+// set once, they follow the account to every device/session:
+//  - Auto-start: begin downloading the moment this page is ready, no
+//    "Start Download" click needed.
+//  - Auto-save: when the download finishes, save it straight to disk
+//    with no extra click. Turned off, the finished download waits as
+//    a "Save Now" step instead (useful for reviewing size/quality
+//    chips before committing 4GB to disk).
+// Saving to the Watch Later library is a separate action entirely —
+// the heart button below — it no longer piggybacks on Auto-save.
 interface StreamPayload {
   url: string;
   source_url?: string | null;
   title?: string | null;
   thumbnail?: string | null;
-  duration?: string | null; // seconds, as a string
+  duration?: string | null;
   quality?: string | null;
-  size?: string | null; // bytes, as a string
+  size?: string | null;
   audio_url?: string | null;
   stream_type?: "dash";
 }
 
 type LimitState = "checking" | "allowed" | "blocked" | "login_required";
-type DownloadState = "idle" | "downloading" | "done" | "error";
-
-const AUTOSTART_KEY = "nexfetch:autostart";
-const AUTOSAVE_KEY = "nexfetch:autosave";
+type DownloadState = "idle" | "downloading" | "paused" | "ready_to_save" | "done" | "error";
 
 function isM3u8(url: string) {
   return url.includes(".m3u8");
@@ -43,39 +46,71 @@ export default function StreamPage() {
   const payload = useMemo(() => decodeDataParam<StreamPayload>(search.get("data")), [search]);
   const uuid = search.get("id");
   const dkey = search.get("dkey");
+  const supabase = useMemo(() => createSupabaseBrowserClient(), []);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<import("hls.js").default | null>(null);
+  const downloadControllerRef = useRef<DownloadController | null>(null);
+  const pendingBlobRef = useRef<{ blob: Blob; container: "mp4" | "ts" } | null>(null);
+  const autoStartedRef = useRef(false);
 
   const [limitState, setLimitState] = useState<LimitState>("checking");
   const [limitMessage, setLimitMessage] = useState("");
   const [playerError, setPlayerError] = useState("");
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState<1 | 2 | 3>(1);
+
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
-  const [autoSave, setAutoSave] = useState(false);
-  const [autoSaved, setAutoSaved] = useState(false);
+  const [autoSave, setAutoSave] = useState(true);
+  const [prefSaving, setPrefSaving] = useState<"autoStart" | "autoSave" | null>(null);
+
+  const [favLoading, setFavLoading] = useState(false);
+  const [favSaved, setFavSaved] = useState(false);
+
   const [filename, setFilename] = useState(payload?.title ?? "");
   const [downloadState, setDownloadState] = useState<DownloadState>("idle");
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [segInfo, setSegInfo] = useState<DownloadProgressInfo>({ fraction: 0, completed: 0, total: 0, bytesLoaded: 0 });
   const [downloadError, setDownloadError] = useState("");
 
+  // ---- load account-level auto-start / auto-save preferences ----
   useEffect(() => {
-    setAutoStart(localStorage.getItem(AUTOSTART_KEY) === "1");
-    setAutoSave(localStorage.getItem(AUTOSAVE_KEY) === "1");
+    supabase
+      .from("profiles")
+      .select("auto_download, auto_save")
+      .single()
+      .then(({ data }) => {
+        if (data) {
+          setAutoStart(Boolean(data.auto_download));
+          setAutoSave(data.auto_save ?? true);
+        }
+        setPrefsLoaded(true);
+      })
+      .catch(() => setPrefsLoaded(true));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  function toggleAutoStart() {
-    setAutoStart((v) => {
-      localStorage.setItem(AUTOSTART_KEY, v ? "0" : "1");
-      return !v;
-    });
+  async function toggleAutoStart() {
+    const next = !autoStart;
+    setAutoStart(next);
+    setPrefSaving("autoStart");
+    const {
+      data: { user }
+    } = await supabase.auth.getUser();
+    if (user) await supabase.from("profiles").update({ auto_download: next }).eq("id", user.id);
+    setPrefSaving(null);
   }
-  function toggleAutoSave() {
-    setAutoSave((v) => {
-      localStorage.setItem(AUTOSAVE_KEY, v ? "0" : "1");
-      return !v;
-    });
+
+  async function toggleAutoSave() {
+    const next = !autoSave;
+    setAutoSave(next);
+    setPrefSaving("autoSave");
+    const {
+      data: { user }
+    } = await supabase.auth.getUser();
+    if (user) await supabase.from("profiles").update({ auto_save: next }).eq("id", user.id);
+    setPrefSaving(null);
   }
 
   // ---- daily 10GB free-plan data cap (login required) ----
@@ -101,23 +136,6 @@ export default function StreamPage() {
       })
       .catch(() => setLimitState("allowed"));
   }, [dkey]);
-
-  useEffect(() => {
-    if (!autoSave || autoSaved || !payload) return;
-    fetch("/api/videos", {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        hash: uuid ?? payload.url,
-        title: payload.title ?? undefined,
-        link: payload.source_url ?? undefined,
-        thumbnail: payload.thumbnail ?? undefined
-      })
-    })
-      .then(() => setAutoSaved(true))
-      .catch(() => {});
-  }, [autoSave, autoSaved, payload, uuid]);
 
   function startPlayback() {
     if (!payload) return;
@@ -180,35 +198,41 @@ export default function StreamPage() {
   }, [isPlaying, payload]);
 
   useEffect(() => {
-    if (autoStart && limitState === "allowed" && payload && !isPlaying) startPlayback();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStart, limitState, payload]);
-
-  useEffect(() => {
     if (videoRef.current) videoRef.current.playbackRate = speed;
   }, [speed]);
 
-  // ---- download ----
-  // Fully browser-side (see lib/hlsDownload.ts) — no extension needed.
-  // After the blob is built, its size is reported to
-  // /api/streaming/report-bytes so tomorrow's check-limit call reflects
-  // today's usage against the 10GB free-plan cap.
-  async function handleDownload() {
+  function triggerBlobSave(blob: Blob, container: "mp4" | "ts", finalName: string) {
+    const ext = container === "mp4" ? "mp4" : "ts";
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = `${finalName}.${ext}`;
+    a.click();
+  }
+
+  // ---- download: fully browser-side, no extension required ----
+  async function startDownload() {
     if (!payload) return;
     setDownloadState("downloading");
     setDownloadProgress(0);
+    setSegInfo({ fraction: 0, completed: 0, total: 0, bytesLoaded: 0 });
     setDownloadError("");
     const finalName = (filename || payload.title || "nexfetch-video").trim();
 
     try {
-      if (payload.stream_type === "dash") {
-        throw new Error("DASH_NOT_SUPPORTED");
-      }
+      if (payload.stream_type === "dash") throw new Error("DASH_NOT_SUPPORTED");
 
       if (isM3u8(payload.url)) {
+        const controller = new DownloadController();
+        downloadControllerRef.current = controller;
+
         const { blob, container } = await downloadHls(payload.url, {
-          onProgress: setDownloadProgress,
-          refererUrl: refererFor(payload)
+          onProgress: (info) => {
+            setDownloadProgress(info.fraction);
+            setSegInfo(info);
+          },
+          refererUrl: refererFor(payload),
+          controller
         });
 
         fetch("/api/streaming/report-bytes", {
@@ -218,31 +242,32 @@ export default function StreamPage() {
           body: JSON.stringify({ bytes: blob.size })
         }).catch(() => {});
 
-        const ext = container === "mp4" ? "mp4" : "ts";
-        const blobUrl = URL.createObjectURL(blob);
-        const fullName = `${finalName}.${ext}`;
-        const a = document.createElement("a");
-        a.href = blobUrl;
-        a.download = fullName;
-        a.click();
+        if (autoSave) {
+          triggerBlobSave(blob, container, finalName);
+          setDownloadState("done");
+        } else {
+          pendingBlobRef.current = { blob, container };
+          setDownloadState("ready_to_save");
+        }
       } else {
-        const fullName = `${finalName}.mp4`;
         const { resolvePlayableUrl } = await import("@/lib/streamProxy");
         const fileUrl = await resolvePlayableUrl(payload);
         const a = document.createElement("a");
         a.href = fileUrl;
-        a.download = fullName;
+        a.download = `${finalName}.mp4`;
         a.click();
+        setDownloadState("done");
       }
-      setDownloadState("done");
     } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      if (msg === "DOWNLOAD_CANCELLED") {
+        setDownloadState("idle");
+        return;
+      }
       // eslint-disable-next-line no-console
       console.error("download failed", err);
       setDownloadState("error");
-
-      const msg = err instanceof Error ? err.message : "";
       const fetchStatus = /^(PLAYLIST_FETCH_FAILED|SEGMENT_FETCH_FAILED)_(\d+)$/.exec(msg);
-
       setDownloadError(
         msg === "ENCRYPTED_STREAM_UNSUPPORTED"
           ? "This stream is encrypted (DRM) — NexFetch can't download it."
@@ -254,10 +279,80 @@ export default function StreamPage() {
                 ? `Download failed — the source returned HTTP ${fetchStatus[2]} while fetching ${
                     fetchStatus[1] === "PLAYLIST_FETCH_FAILED" ? "the playlist" : "a video segment"
                   }. The link may have expired — try reopening this from the extension.`
-                : `Download failed — the source may block cross-origin access from this page.${
-                    msg ? ` (${msg})` : ""
-                  }`
+                : `Download failed — the source may block cross-origin access from this page.${msg ? ` (${msg})` : ""}`
       );
+    }
+  }
+
+  function togglePause() {
+    const c = downloadControllerRef.current;
+    if (!c) return;
+    if (c.paused) {
+      c.resume();
+      setDownloadState("downloading");
+    } else {
+      c.pause();
+      setDownloadState("paused");
+    }
+  }
+
+  function cancelDownload() {
+    downloadControllerRef.current?.cancel();
+  }
+
+  function saveNow() {
+    if (!pendingBlobRef.current || !payload) return;
+    const finalName = (filename || payload.title || "nexfetch-video").trim();
+    triggerBlobSave(pendingBlobRef.current.blob, pendingBlobRef.current.container, finalName);
+    pendingBlobRef.current = null;
+    setDownloadState("done");
+  }
+
+  // ---- Auto-start: begin downloading automatically, once, when the
+  // account preference is on and everything else is ready. ----
+  useEffect(() => {
+    if (
+      autoStartedRef.current ||
+      !prefsLoaded ||
+      !autoStart ||
+      !payload ||
+      limitState !== "allowed" ||
+      downloadState !== "idle"
+    ) {
+      return;
+    }
+    autoStartedRef.current = true;
+    startDownload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefsLoaded, autoStart, payload, limitState, downloadState]);
+
+  // ---- Fav (Watch Later library) — independent of download/auto-save ----
+  async function toggleFav() {
+    if (!payload) return;
+    setFavLoading(true);
+    try {
+      const hash = uuid ?? payload.url;
+      if (!favSaved) {
+        await fetch("/api/videos", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            hash,
+            title: payload.title ?? undefined,
+            link: payload.source_url ?? undefined,
+            thumbnail: payload.thumbnail ?? undefined
+          })
+        });
+        setFavSaved(true);
+      } else {
+        await fetch(`/api/videos?hash=${encodeURIComponent(hash)}`, { method: "DELETE", credentials: "include" });
+        setFavSaved(false);
+      }
+    } catch {
+      /* best effort */
+    } finally {
+      setFavLoading(false);
     }
   }
 
@@ -289,10 +384,7 @@ export default function StreamPage() {
       <div className="mx-auto max-w-2xl px-6 py-16 text-center">
         <GlassCard className="glow-border">
           <p className="text-white">Log in to stream or download this video.</p>
-          <a
-            href={`/login${dkey ? `?dkey=${encodeURIComponent(dkey)}` : ""}`}
-            className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white"
-          >
+          <a href={`/login${dkey ? `?dkey=${encodeURIComponent(dkey)}` : ""}`} className="mt-6 inline-block rounded-full bg-nex-gradient px-6 py-2.5 text-sm font-medium text-white">
             Log in with Google
           </a>
         </GlassCard>
@@ -312,16 +404,26 @@ export default function StreamPage() {
   }
 
   if (!payload) {
-    return (
-      <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">
-        No video data in the link — open this from the NexFetch popup.
-      </div>
-    );
+    return <div className="mx-auto max-w-2xl px-6 py-16 text-center text-white/60">No video data in the link — open this from the NexFetch popup.</div>;
   }
 
   return (
     <div className="mx-auto max-w-4xl px-6 py-12">
-      <h1 className="font-display text-2xl text-white">{payload.title ?? "NexFetch stream"}</h1>
+      <div className="flex items-start justify-between gap-4">
+        <h1 className="font-display text-2xl text-white">{payload.title ?? "NexFetch stream"}</h1>
+        <button
+          onClick={toggleFav}
+          disabled={favLoading}
+          title={favSaved ? "Remove from Watch Later" : "Save to Watch Later"}
+          className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full border transition-colors ${
+            favSaved ? "border-pink-400/60 text-pink-400" : "border-white/15 text-white/60 hover:text-white"
+          } disabled:opacity-50`}
+        >
+          <svg viewBox="0 0 24 24" className="h-5 w-5" fill={favSaved ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.75">
+            <path d="M12 20.5s-7.5-4.6-9.8-9.1C.6 7.9 2.4 4.5 6 4.5c2 0 3.3 1 4 2.2.7-1.2 2-2.2 4-2.2 3.6 0 5.4 3.4 3.8 6.9C19.5 15.9 12 20.5 12 20.5Z" strokeLinejoin="round" />
+          </svg>
+        </button>
+      </div>
 
       <div className="mt-2 flex flex-wrap gap-2">
         {chips.map((c) => (
@@ -333,9 +435,7 @@ export default function StreamPage() {
 
       <div className="relative mt-6 overflow-hidden rounded-2xl glow-border bg-black">
         {playerError ? (
-          <div className="flex aspect-video w-full items-center justify-center px-8 text-center text-white/60">
-            {playerError}
-          </div>
+          <div className="flex aspect-video w-full items-center justify-center px-8 text-center text-white/60">{playerError}</div>
         ) : !isPlaying ? (
           <button onClick={startPlayback} className="group relative flex aspect-video w-full items-center justify-center">
             {payload.thumbnail ? (
@@ -377,16 +477,22 @@ export default function StreamPage() {
           </div>
 
           <label className="flex items-center gap-2 text-sm text-white/70">
-            <input type="checkbox" checked={autoStart} onChange={toggleAutoStart} className="accent-violet-glow" />
+            <input type="checkbox" checked={autoStart} onChange={toggleAutoStart} disabled={!prefsLoaded} className="accent-violet-glow" />
             Auto-start
+            {prefSaving === "autoStart" && <span className="text-xs text-white/40">saving…</span>}
           </label>
 
           <label className="flex items-center gap-2 text-sm text-white/70">
-            <input type="checkbox" checked={autoSave} onChange={toggleAutoSave} className="accent-violet-glow" />
+            <input type="checkbox" checked={autoSave} onChange={toggleAutoSave} disabled={!prefsLoaded} className="accent-violet-glow" />
             Auto-save
-            {autoSave && autoSaved && <span className="text-xs text-green-400">saved ✓</span>}
+            {prefSaving === "autoSave" && <span className="text-xs text-white/40">saving…</span>}
           </label>
         </div>
+        <p className="mt-2 text-xs text-white/35">
+          Auto-start begins the download without clicking the button below. Auto-save writes the finished file to disk
+          immediately; turned off, you&apos;ll get a &quot;Save Now&quot; step once it&apos;s ready. Both are saved to your
+          account, not just this browser.
+        </p>
       </GlassCard>
 
       <GlassCard className="mt-4">
@@ -400,22 +506,59 @@ export default function StreamPage() {
           <span className="text-sm text-white/40">.{isM3u8(payload.url) ? "mp4/ts" : "mp4"}</span>
         </div>
 
-        <button
-          onClick={handleDownload}
-          disabled={downloadState === "downloading"}
-          className="mt-4 flex w-full items-center justify-center gap-2 rounded-full bg-nex-gradient px-5 py-3 text-sm font-medium text-white shadow-lg shadow-violet-deep/30 disabled:opacity-60"
-        >
-          {downloadState === "downloading"
-            ? `Downloading… ${Math.round(downloadProgress * 100)}%`
-            : downloadState === "done"
-              ? "Downloaded — start again"
-              : "Start Download"}
-        </button>
-
-        {downloadState === "downloading" && (
-          <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
-            <div className="h-full bg-nex-gradient transition-all" style={{ width: `${Math.round(downloadProgress * 100)}%` }} />
+        {downloadState === "idle" || downloadState === "error" || downloadState === "done" ? (
+          <button
+            onClick={startDownload}
+            className="mt-4 flex w-full items-center justify-center gap-2 rounded-full bg-nex-gradient px-5 py-3 text-sm font-medium text-white shadow-lg shadow-violet-deep/30"
+          >
+            {downloadState === "done" ? "Downloaded — start again" : "Start Download"}
+          </button>
+        ) : downloadState === "ready_to_save" ? (
+          <button
+            onClick={saveNow}
+            className="mt-4 flex w-full items-center justify-center gap-2 rounded-full bg-nex-gradient px-5 py-3 text-sm font-medium text-white shadow-lg shadow-violet-deep/30"
+          >
+            Save Now
+          </button>
+        ) : (
+          <div className="mt-4 flex items-center gap-2">
+            <button
+              onClick={togglePause}
+              className="flex-1 rounded-full border border-white/15 px-5 py-3 text-sm font-medium text-white/85 transition-colors hover:border-blue-glow/60"
+            >
+              {downloadState === "paused" ? "Resume" : "Pause"}
+            </button>
+            <button
+              onClick={cancelDownload}
+              title="Cancel"
+              className="flex h-11 w-11 items-center justify-center rounded-full border border-white/15 text-white/60 hover:border-red-400/60 hover:text-red-300"
+            >
+              <svg viewBox="0 0 24 24" className="h-4 w-4 fill-none stroke-current" strokeWidth="1.75">
+                <path d="M6 6l12 12M18 6L6 18" strokeLinecap="round" />
+              </svg>
+            </button>
           </div>
+        )}
+
+        {(downloadState === "downloading" || downloadState === "paused") && (
+          <>
+            <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+              <div className="h-full bg-nex-gradient transition-all" style={{ width: `${Math.round(downloadProgress * 100)}%` }} />
+            </div>
+            <div className="mt-2 flex items-center justify-between text-xs text-white/45">
+              <span>{downloadState === "paused" ? "Paused" : "Downloading…"}</span>
+              <span>
+                {segInfo.total > 0 ? `${segInfo.completed}/${segInfo.total} segments · ` : ""}
+                {formatBytes(segInfo.bytesLoaded)} · {Math.round(downloadProgress * 100)}%
+              </span>
+            </div>
+          </>
+        )}
+
+        {downloadState === "ready_to_save" && (
+          <p className="mt-3 text-xs text-white/45">
+            Ready — {formatBytes(pendingBlobRef.current?.blob.size)}. Click Save Now to write it to disk.
+          </p>
         )}
 
         {downloadState === "error" && <p className="mt-3 text-sm text-red-400">{downloadError}</p>}
