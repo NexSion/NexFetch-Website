@@ -5,7 +5,7 @@ import { useSearchParams } from "next/navigation";
 import { decodeDataParam } from "@/lib/dataParam";
 import { downloadHls, DownloadController, type DownloadProgressInfo } from "@/lib/hlsDownload";
 import { refererFor } from "@/lib/streamProxy";
-import { formatBytes, formatDuration } from "@/lib/format";
+import { formatBytes, formatDuration, formatRemaining, formatSpeed } from "@/lib/format";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 import GlassCard from "@/components/GlassCard";
 
@@ -53,6 +53,13 @@ export default function StreamPage() {
   const downloadControllerRef = useRef<DownloadController | null>(null);
   const pendingBlobRef = useRef<{ blob: Blob; container: "mp4" | "ts" } | null>(null);
   const autoStartedRef = useRef(false);
+  // Rolling window of {t, bytesLoaded} samples used to estimate current
+  // speed (and from it, time remaining) — a short window rather than
+  // "bytes so far / total elapsed" so the estimate reacts to the
+  // download actually speeding up or slowing down, not just its average
+  // since the start. Cleared on resume so a pause doesn't get counted
+  // as "the download stalled" in the next speed reading.
+  const speedSamplesRef = useRef<{ t: number; loaded: number }[]>([]);
 
   const [limitState, setLimitState] = useState<LimitState>("checking");
   const [limitMessage, setLimitMessage] = useState("");
@@ -72,7 +79,36 @@ export default function StreamPage() {
   const [downloadState, setDownloadState] = useState<DownloadState>("idle");
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [segInfo, setSegInfo] = useState<DownloadProgressInfo>({ fraction: 0, completed: 0, total: 0, bytesLoaded: 0 });
+  const [etaSeconds, setEtaSeconds] = useState<number | null>(null);
+  const [speedBps, setSpeedBps] = useState<number | null>(null);
   const [downloadError, setDownloadError] = useState("");
+
+  // Feeds one progress sample into the rolling window and derives a
+  // current speed + ETA from it. Kept as a plain function (not part of
+  // the onProgress closure) so togglePause's resume can also reset the
+  // window without duplicating this math.
+  function recordProgressSample(info: DownloadProgressInfo) {
+    const now = performance.now();
+    const samples = speedSamplesRef.current;
+    samples.push({ t: now, loaded: info.bytesLoaded });
+    // keep roughly the last 8s of samples
+    while (samples.length > 1 && now - samples[0].t > 8000) samples.shift();
+
+    if (samples.length >= 2) {
+      const first = samples[0];
+      const elapsedS = (now - first.t) / 1000;
+      const bytesDelta = info.bytesLoaded - first.loaded;
+      if (elapsedS > 0.4 && bytesDelta > 0) {
+        const speed = bytesDelta / elapsedS;
+        setSpeedBps(speed);
+        if (info.completed > 0 && info.total > 0) {
+          const projectedTotal = info.bytesLoaded / (info.completed / info.total);
+          const remainingBytes = Math.max(projectedTotal - info.bytesLoaded, 0);
+          setEtaSeconds(remainingBytes / speed);
+        }
+      }
+    }
+  }
 
   // ---- load account-level auto-start / auto-save preferences ----
   useEffect(() => {
@@ -86,7 +122,8 @@ export default function StreamPage() {
           setAutoSave(data.auto_save ?? true);
         }
         setPrefsLoaded(true);
-      }, () => setPrefsLoaded(true));
+      })
+      .catch(() => setPrefsLoaded(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -215,6 +252,9 @@ export default function StreamPage() {
     setDownloadState("downloading");
     setDownloadProgress(0);
     setSegInfo({ fraction: 0, completed: 0, total: 0, bytesLoaded: 0 });
+    setEtaSeconds(null);
+    setSpeedBps(null);
+    speedSamplesRef.current = [];
     setDownloadError("");
     const finalName = (filename || payload.title || "nexfetch-video").trim();
 
@@ -229,6 +269,7 @@ export default function StreamPage() {
           onProgress: (info) => {
             setDownloadProgress(info.fraction);
             setSegInfo(info);
+            recordProgressSample(info);
           },
           refererUrl: refererFor(payload),
           controller
@@ -287,6 +328,9 @@ export default function StreamPage() {
     const c = downloadControllerRef.current;
     if (!c) return;
     if (c.paused) {
+      speedSamplesRef.current = [];
+      setSpeedBps(null);
+      setEtaSeconds(null);
       c.resume();
       setDownloadState("downloading");
     } else {
@@ -544,11 +588,18 @@ export default function StreamPage() {
             <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
               <div className="h-full bg-nex-gradient transition-all" style={{ width: `${Math.round(downloadProgress * 100)}%` }} />
             </div>
-            <div className="mt-2 flex items-center justify-between text-xs text-white/45">
+            <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-xs text-white/45">
               <span>{downloadState === "paused" ? "Paused" : "Downloading…"}</span>
               <span>
                 {segInfo.total > 0 ? `${segInfo.completed}/${segInfo.total} segments · ` : ""}
                 {formatBytes(segInfo.bytesLoaded)} · {Math.round(downloadProgress * 100)}%
+                {downloadState === "downloading" && (
+                  <>
+                    {formatSpeed(speedBps) ? ` · ${formatSpeed(speedBps)}` : ""}
+                    {" · "}
+                    {formatRemaining(etaSeconds) ?? "calculating…"}
+                  </>
+                )}
               </span>
             </div>
           </>
