@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import GlassCard from "@/components/GlassCard";
 
-interface User {
+export interface User {
   id: string;
   email: string | null;
   role: string;

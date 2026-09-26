@@ -2,21 +2,21 @@ import { redirect } from "next/navigation";
 import { requireAdmin } from "@/lib/admin";
 import { createSupabaseServiceClient } from "@/lib/supabase/server";
 import GlassCard from "@/components/GlassCard";
-import UserRow from "./UserRow";
+import UserRow, { type User } from "./UserRow";
 
 export default async function AdminPage() {
   const admin = await requireAdmin();
   if (!admin) redirect("/login");
 
   const service = createSupabaseServiceClient();
-  const { data: users } = await service
+  const { data: users }: { data: User[] | null } = await service
     .from("profiles")
     .select("id, email, role, is_premium, created_at")
     .order("created_at", { ascending: false })
     .limit(500);
 
   const total = users?.length ?? 0;
-  const premiumCount = users?.filter((u) => u.is_premium || u.role === "admin").length ?? 0;
+  const premiumCount = users?.filter((u: User) => u.is_premium || u.role === "admin").length ?? 0;
 
   return (
     <div className="mx-auto max-w-3xl px-6 py-16">
@@ -40,7 +40,7 @@ export default async function AdminPage() {
             <p className="text-white/60">No accounts yet.</p>
           </GlassCard>
         )}
-        {users?.map((u) => (
+        {users?.map((u: User) => (
           <UserRow key={u.id} user={u} />
         ))}
       </div>

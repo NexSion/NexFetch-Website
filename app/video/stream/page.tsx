@@ -86,8 +86,7 @@ export default function StreamPage() {
           setAutoSave(data.auto_save ?? true);
         }
         setPrefsLoaded(true);
-      })
-      .catch(() => setPrefsLoaded(true));
+      }, () => setPrefsLoaded(true));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

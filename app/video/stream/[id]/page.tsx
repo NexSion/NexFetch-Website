@@ -217,7 +217,7 @@ export default function StreamPage() {
         const { blob, container } = await downloadHls(videoData.url, {
           headers: videoData.headers,
           targetHeight: videoData.height,
-          onProgress: setDownloadProgress,
+          onProgress: (info) => setDownloadProgress(info.fraction),
           refererUrl: refererFor({ url: videoData.url, source_url: videoData.webpage_url ?? null })
         });
 
